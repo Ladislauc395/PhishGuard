@@ -1,17 +1,52 @@
-from sqlmodel import SQLModel, create_engine
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
+"""Configuração de banco de dados com SQLModel."""
 
-# Configuração para o seu PostgreSQL local
-DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost:5432/phishguard"
+from __future__ import annotations
 
-engine = create_async_engine(DATABASE_URL, echo=False)
+import logging
+from contextlib import contextmanager
+from typing import Generator
 
-async def init_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(SQLModel.metadata.create_all)
+from sqlmodel import Session, SQLModel, create_engine
 
-async def get_session():
-    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    async with async_session() as session:
+from backend.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+engine = create_engine(
+    settings.database_url,
+    echo=settings.debug,
+    pool_pre_ping=True,
+)
+
+
+def create_db_and_tables() -> None:
+    """Cria todas as tabelas mapeadas pelos modelos SQLModel."""
+    try:
+        # Import local para garantir que os modelos sejam registrados antes da criação.
+        from backend.models import analysis, brand, email, sms, user  # noqa: F401
+
+        SQLModel.metadata.create_all(engine)
+        logger.info("Tabelas criadas/verificadas com sucesso.")
+    except Exception as exc:  # pragma: no cover - proteção adicional
+        logger.exception("Falha ao criar tabelas: %s", exc)
+        raise
+
+
+@contextmanager
+def session_scope() -> Generator[Session, None, None]:
+    """Context manager para operações transacionais."""
+    session = Session(engine)
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def get_session() -> Generator[Session, None, None]:
+    """Dependency do FastAPI para injeção de sessão."""
+    with Session(engine) as session:
         yield session

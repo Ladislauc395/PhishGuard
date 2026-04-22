@@ -1,40 +1,75 @@
-import sys
-import os
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+"""Aplicação principal FastAPI do PhishGuard."""
 
-# Garante que o Python encontra as pastas core e services
-sys.path.append(os.path.dirname(os.path.realpath(__file__)))
+from __future__ import annotations
 
-from services.heuristic_engine import HeuristicEngine
-from core.database import init_db
+import logging
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
 
-app = FastAPI(title="PhishGuard API")
-engine = HeuristicEngine()
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from sqlmodel import select
 
-@app.on_event("startup")
-async def on_startup():
-    try:
-        await init_db()
-        print("\n✅ [DATABASE] Conexão com PostgreSQL ativa!")
-    except Exception as e:
-        print(f"\n❌ [DATABASE] Erro ao conectar: {e}")
+from backend.core.config import settings
+from backend.core.database import create_db_and_tables, session_scope
+from backend.models.brand import BrandProfile, DEFAULT_BRANDS
+from backend.routers import analyze, dashboard
 
-class URLRequest(BaseModel):
-    url: str
 
-@app.post("/api/analyze/url")
-async def analyze_url(request: URLRequest):
-    score, reasons = await engine.analyze_url(request.url)
-    verdict = "🔴 NÃO SEGURO" if score >= 60 else "✅ SEGURO"
-    reasons_str = ", ".join(reasons) if reasons else "Nenhuma ameaça óbvia"
-    return {
-        "url": request.url, 
-        "score": score, 
-        "verdict": verdict, 
-        "reasons": reasons_str
-    }
+logging.basicConfig(
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
+    format='%(asctime)s | %(levelname)s | %(name)s | %(message)s',
+)
+logger = logging.getLogger(__name__)
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+def seed_brands_if_empty() -> None:
+    """Garante que as marcas iniciais existam na base."""
+    with session_scope() as session:
+        existing = session.exec(select(BrandProfile)).all()
+        if existing:
+            logger.info("Seed de marcas ignorado: já existem %s registos.", len(existing))
+            return
+
+        for entry in DEFAULT_BRANDS:
+            session.add(
+                BrandProfile(
+                    name=str(entry["name"]),
+                    official_domains=list(entry["official_domains"]),
+                    keywords=list(entry["keywords"]),
+                )
+            )
+        logger.info("Seed inicial concluído com %s marcas angolanas.", len(DEFAULT_BRANDS))
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    create_db_and_tables()
+    seed_brands_if_empty()
+    logger.info("Aplicação PhishGuard inicializada com sucesso.")
+    yield
+    logger.info("Encerrando aplicação PhishGuard.")
+
+
+app = FastAPI(
+    title=settings.app_name,
+    version=settings.app_version,
+    debug=settings.debug,
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=settings.cors_allow_credentials,
+    allow_methods=settings.cors_allow_methods,
+    allow_headers=settings.cors_allow_headers,
+)
+
+app.include_router(analyze.router, prefix=settings.api_prefix)
+app.include_router(dashboard.router, prefix=settings.api_prefix)
+
+
+@app.get("/health")
+async def health_check() -> dict[str, str]:
+    return {"status": "ok", "service": "phishguard-backend"}
