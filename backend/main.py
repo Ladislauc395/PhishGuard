@@ -1,75 +1,106 @@
-"""Aplicação principal FastAPI do PhishGuard."""
+"""PhishGuard API — detecção de phishing e smishing."""
 
 from __future__ import annotations
 
+import json
 import logging
+import sys
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from datetime import datetime, timezone
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlmodel import select
-
-from backend.core.config import settings
-from backend.core.database import create_db_and_tables, session_scope
-from backend.models.brand import BrandProfile, DEFAULT_BRANDS
-from backend.routers import analyze, dashboard
-
-
-logging.basicConfig(
-    level=getattr(logging, settings.log_level.upper(), logging.INFO),
-    format='%(asctime)s | %(levelname)s | %(name)s | %(message)s',
-)
-logger = logging.getLogger(__name__)
+from backend.routers.extension_router import router as extension_router
+from backend.routers import integrations
+from backend.routers.analyze import router as analyze_router
+from backend.routers.dashboard import router as dashboard_router
+from backend.routers.auth import router as auth_router
+from backend.routers.gmail_router import router as gmail_router   # ← NOVO
+from backend.core.database import create_db_and_tables
 
 
-def seed_brands_if_empty() -> None:
-    """Garante que as marcas iniciais existam na base."""
-    with session_scope() as session:
-        existing = session.exec(select(BrandProfile)).all()
-        if existing:
-            logger.info("Seed de marcas ignorado: já existem %s registos.", len(existing))
-            return
+# ─── Logging JSON ─────────────────────────────────────────────────
 
-        for entry in DEFAULT_BRANDS:
-            session.add(
-                BrandProfile(
-                    name=str(entry["name"]),
-                    official_domains=list(entry["official_domains"]),
-                    keywords=list(entry["keywords"]),
-                )
-            )
-        logger.info("Seed inicial concluído com %s marcas angolanas.", len(DEFAULT_BRANDS))
+class _JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return json.dumps({
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        })
 
+
+def _setup_logging() -> None:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(_JsonFormatter())
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers = [handler]
+
+
+_setup_logging()
+logger = logging.getLogger("phishguard.main")
+
+
+# ─── Lifespan ─────────────────────────────────────────────────────
 
 @asynccontextmanager
-async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+async def lifespan(app: FastAPI):
     create_db_and_tables()
-    seed_brands_if_empty()
-    logger.info("Aplicação PhishGuard inicializada com sucesso.")
+    logger.info("Base de dados PostgreSQL pronta.")
     yield
-    logger.info("Encerrando aplicação PhishGuard.")
+    logger.info("PhishGuard API encerrada.")
 
+
+# ─── App ──────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title=settings.app_name,
-    version=settings.app_version,
-    debug=settings.debug,
+    title="PhishGuard API",
+    description=(
+        "Detecção de phishing e smishing com score acumulado. "
+        "NUNCA assume seguro por ausência em blacklist."
+    ),
+    version="2.1.0",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_credentials=settings.cors_allow_credentials,
-    allow_methods=settings.cors_allow_methods,
-    allow_headers=settings.cors_allow_headers,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-app.include_router(analyze.router, prefix=settings.api_prefix)
-app.include_router(dashboard.router, prefix=settings.api_prefix)
+
+# ─── Routers ──────────────────────────────────────────────────────
+
+app.include_router(auth_router)                                    # /auth/*
+app.include_router(analyze_router)                                 # /analyze/*
+app.include_router(dashboard_router)                               # /dashboard/*
+app.include_router(integrations.router)                            # /integrations/*
+app.include_router(extension_router, prefix="/extension")
+# Gmail router registado com prefixo /integrations para que o Flutter
+# encontre os endpoints nos URLs que já usa:
+#   /integrations/auth/gmail/url
+#   /integrations/auth/gmail/callback
+#   /integrations/gmail/emails/all      ← getAllAnalysedEmails()
+#   /integrations/gmail/emails/blocked  ← getBlockedEmails()
+#   /integrations/gmail/scan
+#   /integrations/gmail/unblock/{id}
+app.include_router(gmail_router, prefix="/integrations")           # ← NOVO
 
 
-@app.get("/health")
-async def health_check() -> dict[str, str]:
-    return {"status": "ok", "service": "phishguard-backend"}
+# ─── Health ───────────────────────────────────────────────────────
+
+@app.get("/health", tags=["Status"])
+async def health():
+    return {"status": "ok", "version": "2.1.0"}
+
+
+# ─── Entry point ──────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("backend.main:app", host="0.0.0.0", port=8000, reload=False)
+    

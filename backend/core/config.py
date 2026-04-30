@@ -1,59 +1,65 @@
-"""Configurações centrais da aplicação PhishGuard."""
+"""Configuração central da aplicação (via variáveis de ambiente)."""
 
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass, field
-from typing import List
-
-from dotenv import load_dotenv
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-load_dotenv()
-
-
-@dataclass(slots=True)
-class Settings:
-    """Estrutura de configurações carregadas por variáveis de ambiente."""
-
-    app_name: str = os.getenv("APP_NAME", "PhishGuard API")
-    app_version: str = os.getenv("APP_VERSION", "1.0.0")
-    app_env: str = os.getenv("APP_ENV", "development")
-    debug: bool = os.getenv("DEBUG", "false").lower() in {"1", "true", "yes"}
-
-    api_prefix: str = os.getenv("API_PREFIX", "/api")
-
-    database_url: str = os.getenv(
-        "DATABASE_URL",
-        "postgresql+psycopg2://phishguard_user:phishguard_password@localhost:5432/phishguard",
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        extra="ignore",
+        case_sensitive=False,
     )
 
-    secret_key: str = os.getenv(
-        "SECRET_KEY",
-        "trocar-em-producao-chave-secreta-phishguard",
-    )
-    access_token_expire_minutes: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+    # ── Base de dados ──────────────────────────────────────────
+    DATABASE_URL: str = "postgresql+psycopg2://ladislau:1234@localhost:5432/phishguard"
+    DEBUG: bool = False
 
-    cors_origins_raw: str = os.getenv(
-        "CORS_ORIGINS",
-        "http://localhost:3000,http://127.0.0.1:3000",
-    )
-    cors_allow_credentials: bool = (
-        os.getenv("CORS_ALLOW_CREDENTIALS", "true").lower() in {"1", "true", "yes"}
-    )
-    cors_allow_methods: List[str] = field(
-        default_factory=lambda: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-    )
-    cors_allow_headers: List[str] = field(
-        default_factory=lambda: ["Authorization", "Content-Type", "X-Requested-With"]
-    )
+    # ── JWT ────────────────────────────────────────────────────
+    SECRET_KEY: str = "CHANGE_ME_IN_PRODUCTION_USE_OPENSSL_RAND_HEX_32"
 
-    log_level: str = os.getenv("LOG_LEVEL", "INFO")
+    # ── Google OAuth (login com Google) ───────────────────────
+    GOOGLE_CLIENT_ID: str = ""
 
-    @property
-    def cors_origins(self) -> List[str]:
-        """Converte a string de origens CORS para lista."""
-        return [origin.strip() for origin in self.cors_origins_raw.split(",") if origin.strip()]
+    # ── Gmail Integration ──────────────────────────────────────
+    GMAIL_CLIENT_ID: str = ""
+    GMAIL_CLIENT_SECRET: str = ""
+    GMAIL_REFRESH_TOKEN: str = ""
+    GMAIL_REDIRECT_URI: str = "http://localhost"
+
+    # ── VirusTotal ─────────────────────────────────────────────
+    VIRUSTOTAL_API_KEY: str = ""
+
+    # ── AbuseIPDB ──────────────────────────────────────────────
+    ABUSEIPDB_API_KEY: str = ""
+
+    # ── URLScan.io ─────────────────────────────────────────────
+    URLSCAN_API: str = ""           # nome no .env
+    URLSCAN_API_KEY: str = ""       # alias usado no código
+
+    def model_post_init(self, __context):
+        # Garante que URLSCAN_API_KEY usa URLSCAN_API se não definido
+        if self.URLSCAN_API and not self.URLSCAN_API_KEY:
+            object.__setattr__(self, 'URLSCAN_API_KEY', self.URLSCAN_API)
+
+    # ── Google Safe Browsing ───────────────────────────────────
+    GOOGLE_SAFE_BROWSING_API_KEY: str = ""
+
+    # ── Google Custom Search ───────────────────────────────────
+    GOOGLE_CUSTOM_SEARCH_API_KEY: str = ""
+    GOOGLE_CUSTOM_SEARCH_ENGINE_ID: str = ""
+
+    # ── Twilio (SMS) ───────────────────────────────────────────
+    TWILIO_ACCOUNT_SID: str = ""
+    TWILIO_AUTH_TOKEN: str = ""
+
+    # ── Numverify (validação de números) ──────────────────────
+    NUMVERIFY_API_KEY: str = ""
+
+    # ── Groq (IA) ──────────────────────────────────────────────
+    GROQ_API_KEY: str = ""
+    GROQ_MODEL: str = "llama-3.1-70b-versatile"
 
 
 settings = Settings()

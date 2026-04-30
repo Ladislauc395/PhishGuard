@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="UTF-8">
+<title>PhishGuard Angola</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    width: 360px;
+    min-height: 480px;
+    background: #0e0820;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    color: #e8dfff;
+    overflow-x: hidden;
+  }
+
+  /* ── Header ── */
+  .header {
+    background: linear-gradient(135deg, #1a0e38, #2a1260);
+    padding: 16px 18px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    border-bottom: 1px solid rgba(130,80,255,0.2);
+  }
+
+  .header-logo { font-size: 26px; }
+
+  .header-text h1 {
+    font-size: 15px;
+    font-weight: 700;
+    color: #e8dfff;
+    letter-spacing: -0.2px;
+  }
+
+  .header-text p {
+    font-size: 11px;
+    color: #7060a0;
+    margin-top: 1px;
+  }
+
+  .toggle-wrap {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .toggle-label { font-size: 11px; color: #7060a0; }
+
+  .toggle {
+    position: relative;
+    width: 38px;
+    height: 20px;
+    cursor: pointer;
+  }
+
+  .toggle input { opacity: 0; width: 0; height: 0; position: absolute; }
+
+  .slider {
+    position: absolute;
+    inset: 0;
+    background: #2a1f45;
+    border-radius: 10px;
+    transition: 0.2s;
+  }
+
+  .slider::before {
+    content: "";
+    position: absolute;
+    width: 14px;
+    height: 14px;
+    left: 3px;
+    top: 3px;
+    background: #6b5b8a;
+    border-radius: 50%;
+    transition: 0.2s;
+  }
+
+  input:checked + .slider { background: #6c3fc7; }
+  input:checked + .slider::before {
+    transform: translateX(18px);
+    background: #fff;
+  }
+
+  /* ── Current page section ── */
+  .section { padding: 14px 18px; }
+
+  .section-title {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #4a3c70;
+    margin-bottom: 10px;
+    font-weight: 600;
+  }
+
+  .current-card {
+    background: #150d2e;
+    border-radius: 10px;
+    padding: 14px 16px;
+    border: 1px solid rgba(100,60,180,0.2);
+  }
+
+  .current-url {
+    font-size: 11px;
+    color: #6b5b8a;
+    font-family: monospace;
+    word-break: break-all;
+    margin-bottom: 10px;
+  }
+
+  .status-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .status-dot.safe    { background: #3ddc84; box-shadow: 0 0 6px rgba(61,220,132,0.5); }
+  .status-dot.warn    { background: #ff9a3b; box-shadow: 0 0 6px rgba(255,154,59,0.5); }
+  .status-dot.danger  { background: #ff3b3b; box-shadow: 0 0 6px rgba(255,59,59,0.5); }
+  .status-dot.loading { background: #5a4878; animation: pulse 1s infinite; }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.3; }
+  }
+
+  .status-text { font-size: 13px; font-weight: 600; }
+  .status-text.safe   { color: #3ddc84; }
+  .status-text.warn   { color: #ff9a3b; }
+  .status-text.danger { color: #ff3b3b; }
+
+  .score-badge {
+    margin-left: auto;
+    font-size: 20px;
+    font-weight: 800;
+    min-width: 38px;
+    text-align: right;
+  }
+
+  .score-badge.safe   { color: #3ddc84; }
+  .score-badge.warn   { color: #ff9a3b; }
+  .score-badge.danger { color: #ff3b3b; }
+
+  .reasons-mini {
+    margin-top: 10px;
+    border-top: 1px solid rgba(100,60,180,0.15);
+    padding-top: 8px;
+  }
+
+  .reason-mini-item {
+    font-size: 11px;
+    color: #9080b8;
+    padding: 2px 0;
+    display: flex;
+    gap: 6px;
+  }
+
+  .reason-mini-item::before { content: "·"; color: #ff9a3b; }
+
+  .btn-scan {
+    margin-top: 10px;
+    width: 100%;
+    padding: 9px;
+    background: linear-gradient(135deg, #4a1fa8, #6c3fc7);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.15s;
+  }
+
+  .btn-scan:hover { opacity: 0.9; }
+  .btn-scan:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* ── Stats row ── */
+  .stats-row {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    padding: 0 18px 14px;
+  }
+
+  .stat-card {
+    background: #150d2e;
+    border-radius: 8px;
+    padding: 10px;
+    text-align: center;
+    border: 1px solid rgba(100,60,180,0.15);
+  }
+
+  .stat-num {
+    font-size: 22px;
+    font-weight: 800;
+    color: #9070d8;
+  }
+
+  .stat-num.red  { color: #ff3b3b; }
+  .stat-num.warn { color: #ff9a3b; }
+
+  .stat-label {
+    font-size: 10px;
+    color: #4a3c70;
+    margin-top: 2px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  /* ── History ── */
+  .history-list {
+    max-height: 160px;
+    overflow-y: auto;
+    padding: 0 18px 14px;
+  }
+
+  .history-list::-webkit-scrollbar { width: 3px; }
+  .history-list::-webkit-scrollbar-track { background: #0e0820; }
+  .history-list::-webkit-scrollbar-thumb { background: #3a2c5a; border-radius: 4px; }
+
+  .history-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+    border-radius: 7px;
+    margin-bottom: 4px;
+    background: #120b26;
+    border: 1px solid rgba(80,50,140,0.15);
+  }
+
+  .history-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .history-dot.safe   { background: #3ddc84; }
+  .history-dot.warn   { background: #ff9a3b; }
+  .history-dot.danger { background: #ff3b3b; }
+
+  .history-url {
+    flex: 1;
+    font-size: 11px;
+    color: #8070a8;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .history-score {
+    font-size: 11px;
+    font-weight: 700;
+    min-width: 28px;
+    text-align: right;
+  }
+
+  .history-score.safe   { color: #3ddc84; }
+  .history-score.warn   { color: #ff9a3b; }
+  .history-score.danger { color: #ff3b3b; }
+
+  /* ── Settings ── */
+  .settings-panel {
+    padding: 0 18px 16px;
+    display: none;
+  }
+
+  .settings-panel.open { display: block; }
+
+  .setting-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 0;
+    border-bottom: 1px solid rgba(80,50,140,0.1);
+  }
+
+  .setting-row:last-child { border-bottom: none; }
+
+  .setting-label {
+    font-size: 12px;
+    color: #b0a0d0;
+  }
+
+  .setting-label small {
+    display: block;
+    font-size: 10px;
+    color: #4a3c70;
+    margin-top: 1px;
+  }
+
+  .threshold-input {
+    width: 52px;
+    background: #1a0f35;
+    border: 1px solid rgba(100,60,180,0.3);
+    border-radius: 6px;
+    color: #e8dfff;
+    font-size: 13px;
+    font-weight: 600;
+    padding: 4px 8px;
+    text-align: center;
+  }
+
+  /* ── Tabs ── */
+  .tabs {
+    display: flex;
+    border-bottom: 1px solid rgba(80,50,140,0.2);
+    padding: 0 18px;
+  }
+
+  .tab {
+    font-size: 11px;
+    font-weight: 600;
+    color: #4a3c70;
+    padding: 8px 0;
+    margin-right: 18px;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    transition: color 0.15s;
+  }
+
+  .tab.active { color: #a080e8; border-bottom-color: #6c3fc7; }
+
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  /* ── Footer ── */
+  .footer {
+    padding: 10px 18px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-top: 1px solid rgba(80,50,140,0.15);
+  }
+
+  .footer-link {
+    font-size: 10px;
+    color: #3a2c5a;
+    cursor: pointer;
+    text-decoration: none;
+    transition: color 0.15s;
+  }
+
+  .footer-link:hover { color: #8060c0; }
+
+  .api-status {
+    font-size: 10px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    color: #4a3c70;
+  }
+
+  .api-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #2a1f45;
+  }
+
+  .api-dot.online  { background: #3ddc84; }
+  .api-dot.offline { background: #ff3b3b; }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <div class="header-logo">🛡️</div>
+  <div class="header-text">
+    <h1>PhishGuard Angola</h1>
+    <p>Protecção anti-phishing em tempo real</p>
+  </div>
+  <div class="toggle-wrap">
+    <span class="toggle-label">ON</span>
+    <label class="toggle">
+      <input type="checkbox" id="toggle-enabled" checked>
+      <span class="slider"></span>
+    </label>
+  </div>
+</div>
+
+<!-- Current page -->
+<div class="section">
+  <div class="section-title">Página Actual</div>
+  <div class="current-card">
+    <div class="current-url" id="current-url">Carregando…</div>
+    <div class="status-row">
+      <div class="status-dot loading" id="status-dot"></div>
+      <div class="status-text" id="status-text">A verificar…</div>
+      <div class="score-badge" id="score-badge">–</div>
+    </div>
+    <div class="reasons-mini" id="reasons-mini" style="display:none"></div>
+    <button class="btn-scan" id="btn-scan">🔍 Verificar Agora</button>
+  </div>
+</div>
+
+<!-- Stats -->
+<div class="stats-row">
+  <div class="stat-card">
+    <div class="stat-num" id="stat-total">0</div>
+    <div class="stat-label">Verificadas</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-num warn" id="stat-warn">0</div>
+    <div class="stat-label">Suspeitas</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-num red" id="stat-block">0</div>
+    <div class="stat-label">Bloqueadas</div>
+  </div>
+</div>
+
+<!-- Tabs -->
+<div class="tabs">
+  <div class="tab active" data-tab="history">Histórico</div>
+  <div class="tab" data-tab="settings">Definições</div>
+</div>
+
+<!-- History tab -->
+<div class="tab-content active" id="tab-history">
+  <div class="history-list" id="history-list">
+    <div style="color:#3a2c5a;font-size:12px;padding:10px 0;text-align:center;">Sem histórico ainda</div>
+  </div>
+</div>
+
+<!-- Settings tab -->
+<div class="tab-content" id="tab-settings">
+  <div class="settings-panel open">
+
+    <div class="setting-row">
+      <div class="setting-label">
+        Bloquear phishing automático
+        <small>Redirige para página de aviso</small>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="s-auto-block" checked>
+        <span class="slider"></span>
+      </label>
+    </div>
+
+    <div class="setting-row">
+      <div class="setting-label">
+        Threshold de bloqueio
+        <small>Score ≥ este valor → bloquear</small>
+      </div>
+      <input type="number" class="threshold-input" id="s-block-threshold" value="60" min="30" max="100">
+    </div>
+
+    <div class="setting-row">
+      <div class="setting-label">
+        Threshold de aviso
+        <small>Score ≥ este valor → alertar</small>
+      </div>
+      <input type="number" class="threshold-input" id="s-warn-threshold" value="30" min="10" max="70">
+    </div>
+
+    <div class="setting-row">
+      <div class="setting-label">
+        Verificar links da página
+        <small>Destaca links suspeitos</small>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="s-check-links" checked>
+        <span class="slider"></span>
+      </label>
+    </div>
+
+    <div class="setting-row">
+      <div class="setting-label">
+        Notificações
+        <small>Alertas do sistema</small>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="s-notifications" checked>
+        <span class="slider"></span>
+      </label>
+    </div>
+
+    <div class="setting-row">
+      <div class="setting-label">
+        URL da API PhishGuard
+        <small>Backend FastAPI</small>
+      </div>
+    </div>
+    <div style="padding-bottom:10px;">
+      <input type="text" id="s-api-url" value="http://localhost:8000"
+        style="width:100%;background:#1a0f35;border:1px solid rgba(100,60,180,0.3);border-radius:6px;color:#e8dfff;font-size:11px;padding:6px 10px;font-family:monospace;">
+    </div>
+
+    <button onclick="saveSettings()" style="width:100%;padding:9px;background:#4a1fa8;color:#fff;border:none;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;margin-bottom:8px;">
+      💾 Guardar Definições
+    </button>
+    <button onclick="clearHistory()" style="width:100%;padding:7px;background:transparent;color:#4a3c70;border:1px solid #2a1f45;border-radius:8px;font-size:11px;cursor:pointer;">
+      🗑️ Limpar Histórico
+    </button>
+  </div>
+</div>
+
+<!-- Footer -->
+<div class="footer">
+  <div class="api-status">
+    <div class="api-dot" id="api-dot"></div>
+    <span id="api-status-text">API…</span>
+  </div>
+  <span class="footer-link" onclick="openDashboard()">📊 Dashboard</span>
+</div>
+
+<script src="popup.js"></script>
+</body>
+</html>

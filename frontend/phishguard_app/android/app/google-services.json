@@ -1,0 +1,39 @@
+{
+  "project_info": {
+    "project_number": "804019981020",
+    "project_id": "brave-monitor-494116-s2",
+    "storage_bucket": "brave-monitor-494116-s2.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:804019981020:android:5bdb2b9954ce6a3851c219",
+        "android_client_info": {
+          "package_name": "com.example.phishguard_app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "804019981020-9o66mreoo92ek29425061qg7hhvjg02q.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAwFPEhzNQSDHbf9boENyYtjGFLEIgn59Y"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "804019981020-9o66mreoo92ek29425061qg7hhvjg02q.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

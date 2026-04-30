@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PhishGuard — Página Bloqueada</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    min-height: 100vh;
+    background: radial-gradient(ellipse at 60% 10%, #1c0a3a 0%, #0a0515 60%);
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    padding: 24px; color: #e8dfff;
+  }
+
+  .card {
+    background: rgba(25,14,50,0.95); border: 2px solid #ff3b3b; border-radius: 20px;
+    padding: 44px 48px; max-width: 600px; width: 100%; text-align: center;
+    box-shadow: 0 0 80px rgba(255,59,59,.25), 0 32px 64px rgba(0,0,0,.7);
+    animation: fadeIn 0.3s ease;
+  }
+
+  @keyframes fadeIn {
+    from { opacity:0; transform:translateY(-16px); }
+    to   { opacity:1; transform:translateY(0); }
+  }
+
+  .shield { font-size: 76px; margin-bottom: 12px; filter: drop-shadow(0 0 20px rgba(255,59,59,.5)); }
+  h1 { font-size: 30px; font-weight: 800; color: #ff3b3b; margin-bottom: 10px; letter-spacing: -.5px; }
+  .subtitle { color: #b0a0d0; font-size: 14px; line-height: 1.6; margin-bottom: 26px; }
+
+  .score-row {
+    background: rgba(255,59,59,.1); border: 1px solid rgba(255,59,59,.3); border-radius: 12px;
+    padding: 16px 20px; display: flex; align-items: center; gap: 16px; margin-bottom: 20px; text-align: left;
+  }
+
+  .score-num { font-size: 50px; font-weight: 900; color: #ff3b3b; line-height: 1; min-width: 66px; }
+  .score-info .label { font-size: 12px; color: #9080c0; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }
+  .score-info .verdict { font-size: 17px; font-weight: 700; color: #ff3b3b; }
+
+  .reasons-box {
+    background: rgba(10,5,20,.8); border: 1px solid rgba(100,60,180,.25); border-radius: 10px;
+    padding: 12px 16px; margin-bottom: 20px; text-align: left; max-height: 170px; overflow-y: auto;
+  }
+  .reasons-box::-webkit-scrollbar { width: 4px; }
+  .reasons-box::-webkit-scrollbar-thumb { background: #5a3ea0; border-radius: 4px; }
+
+  .reason-item {
+    display: flex; gap: 8px; margin-bottom: 7px;
+    font-size: 12.5px; color: #d0c8e8; line-height: 1.5;
+  }
+  .reason-item::before { content: "⚠️"; flex-shrink: 0; }
+
+  .url-box {
+    background: rgba(10,5,20,.6); border: 1px solid rgba(255,59,59,.2); border-radius: 8px;
+    padding: 10px 14px; font-size: 11px; color: #6b5b8a; word-break: break-all;
+    font-family: 'Consolas','Courier New',monospace; margin-bottom: 26px; text-align: left;
+  }
+  .url-label { color: #4a3c70; font-size: 10px; text-transform: uppercase; letter-spacing: .8px; margin-bottom: 4px; }
+
+  .tags { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-bottom: 22px; }
+  .tag {
+    background: rgba(255,59,59,.15); border: 1px solid rgba(255,59,59,.35);
+    color: #ff8080; font-size: 11px; font-weight: 600;
+    padding: 3px 10px; border-radius: 20px; text-transform: uppercase; letter-spacing: .5px;
+  }
+
+  .btn-group { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+
+  .btn {
+    padding: 12px 28px; border-radius: 10px; font-size: 13px; font-weight: 600;
+    cursor: pointer; border: none; transition: transform .15s; text-decoration: none;
+    display: inline-flex; align-items: center; gap: 8px;
+  }
+  .btn:hover { transform: translateY(-2px); }
+  .btn-back { background: linear-gradient(135deg,#7c3ced,#4a1fa8); color: #fff; box-shadow: 0 6px 24px rgba(124,60,237,.4); }
+  .btn-proceed { background: transparent; color: #5a4878; border: 1px solid #3a2c5a; font-size: 12px; padding: 10px 20px; }
+  .btn-proceed:hover { color: #ff3b3b; border-color: #ff3b3b; }
+
+  .powered { margin-top: 22px; color: #2a1f45; font-size: 11px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="shield">🛡️</div>
+  <h1>Phishing Bloqueado!</h1>
+  <p class="subtitle">
+    Esta página foi identificada como maliciosa e bloqueada para proteger
+    as suas credenciais, dados bancários e informações pessoais.
+  </p>
+
+  <div class="score-row">
+    <div class="score-num" id="score">–</div>
+    <div class="score-info">
+      <div class="label">Pontuação de Risco</div>
+      <div class="verdict" id="verdict">NÃO SEGURO</div>
+    </div>
+  </div>
+
+  <div class="tags" id="tags"></div>
+
+  <div class="reasons-box" id="reasons">
+    <div class="reason-item">Carregando detalhes…</div>
+  </div>
+
+  <div class="url-box">
+    <div class="url-label">URL Bloqueada</div>
+    <div id="blocked-url">–</div>
+  </div>
+
+  <div class="btn-group">
+    <button class="btn btn-back"    onclick="goBack()">← Voltar para segurança</button>
+    <button class="btn btn-proceed" onclick="proceedAnyway()">Continuar mesmo assim (risco)</button>
+  </div>
+
+  <div class="powered">🔒 Protegido por PhishGuard Angola</div>
+</div>
+
+<script>
+  (function () {
+    const params  = new URLSearchParams(location.search);
+    const url     = params.get("blocked_url") || "";
+    const score   = parseInt(params.get("score") || "0", 10);
+    const verdict = params.get("verdict") || "NÃO SEGURO";
+    let reasons   = [];
+
+    try { reasons = JSON.parse(params.get("reasons") || "[]"); } catch { }
+
+    // Preencher UI
+    document.getElementById("score").textContent      = score;
+    document.getElementById("verdict").textContent    = verdict;
+    document.getElementById("blocked-url").textContent = url;
+
+    // Tags automáticas
+    const tagData = [];
+    const r = reasons.join(" ").toLowerCase();
+    if (/phishing|credential|harvest/.test(r)) tagData.push("Credential Harvesting");
+    if (/typosquat/.test(r))                   tagData.push("Typosquatting");
+    if (/spoof/.test(r))                        tagData.push("Spoofing");
+    if (/virustotal/.test(r))                   tagData.push("VirusTotal");
+    if (/safe.browsing/.test(r))                tagData.push("Safe Browsing");
+    if (/yara/.test(r))                         tagData.push("YARA");
+    if (tagData.length === 0)                   tagData.push("URL Maliciosa");
+
+    document.getElementById("tags").innerHTML =
+      tagData.map(t => `<span class="tag">${escHtml(t)}</span>`).join("");
+
+    // Razões
+    const reasonBox = document.getElementById("reasons");
+    reasonBox.innerHTML = reasons.length > 0
+      ? reasons.slice(0, 8).map(r => `<div class="reason-item">${escHtml(r)}</div>`).join("")
+      : `<div class="reason-item">Múltiplos indicadores de phishing detectados.</div>`;
+
+    // ── Botões ────────────────────────────────────────────────────
+
+    function goBack() {
+      if (window.history.length > 1) {
+        // Voltar 2 entradas: a página de bloqueio + a URL bloqueada
+        window.history.go(-2);
+      } else {
+        window.location.href = "https://www.google.com";
+      }
+    }
+
+    function proceedAnyway() {
+      if (!confirm("⚠️ AVISO: Esta página é perigosa!\n\nTem a certeza que deseja continuar?\nOs seus dados podem ser roubados.")) return;
+      try {
+        chrome.runtime.sendMessage({ type: "APPROVE_URL", url }, () => {
+          window.history.back();
+        });
+      } catch {
+        window.history.back();
+      }
+    }
+
+    // Expor no escopo global
+    window.goBack        = goBack;
+    window.proceedAnyway = proceedAnyway;
+
+    function escHtml(s) {
+      return String(s)
+        .replace(/&/g,"&amp;").replace(/</g,"&lt;")
+        .replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+    }
+  })();
+</script>
+</body>
+</html>

@@ -13,8 +13,8 @@ from backend.core.config import settings
 logger = logging.getLogger(__name__)
 
 engine = create_engine(
-    settings.database_url,
-    echo=settings.debug,
+    settings.DATABASE_URL,
+    echo=settings.DEBUG,
     pool_pre_ping=True,
 )
 
@@ -50,3 +50,6 @@ def get_session() -> Generator[Session, None, None]:
     """Dependency do FastAPI para injeção de sessão."""
     with Session(engine) as session:
         yield session
+
+
+        

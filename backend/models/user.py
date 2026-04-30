@@ -1,33 +1,47 @@
-"""Modelo de utilizador para fases futuras."""
+"""Modelo de utilizador para autenticação (PostgreSQL)."""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Optional
 
-from sqlalchemy import Column
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import Column, DateTime, String, Text
 from sqlmodel import Field, SQLModel
 
 
-class UserBase(SQLModel):
-    email: str = Field(max_length=255, unique=True, index=True)
-    settings: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB))
-
-
-class User(UserBase, table=True):
+class User(SQLModel, table=True):
     __tablename__ = "users"
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), index=True)
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), index=True)
 
+    # VARCHAR com limite — eficiente para índices no Postgres
+    name: str = Field(sa_column=Column(String(120), nullable=False))
+    email: str = Field(
+        sa_column=Column(String(254), unique=True, index=True, nullable=False)
+    )
 
-class UserCreate(UserBase):
-    pass
+    # TEXT — hash bcrypt tem ~60 chars mas Text é mais seguro para futuro
+    hashed_password: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
 
+    # Google OAuth
+    google_id: Optional[str] = Field(
+        default=None,
+        sa_column=Column(String(128), unique=True, index=True, nullable=True),
+    )
+    avatar_url: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
 
-class UserRead(UserBase):
-    id: int
-    created_at: datetime
-    updated_at: datetime
+    # "local" | "google"
+    provider: str = Field(
+        sa_column=Column(String(20), nullable=False, server_default="local")
+    )
+
+    # TIMESTAMPTZ — guarda fuso horário no Postgres
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(tz=timezone.utc),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+    
