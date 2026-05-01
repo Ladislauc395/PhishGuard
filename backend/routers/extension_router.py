@@ -1,38 +1,14 @@
 """
 backend/routers/extension_router.py
 ──────────────────────────────────────────────────────────────────────────────
-Router da extensão Chrome PhishGuard Angola — v4.0
+Router da extensão Chrome PhishGuard Angola — v5.0
 
-CORRECÇÕES CRÍTICAS v4.0 (em relação à v3.0):
-  ┌─────────────────────────────────────────────────────────────────────────┐
-  │ BUG 1 (CRÍTICO) — APIs externas nunca corriam quando blacklist dava hit │
-  │   ANTES:  `if _HAS_EXTERNAL_APIS and should_check_apis and             │
-  │            not blacklisted:`  ← blacklisted=True bloqueava VT/GSB      │
-  │   AGORA:  APIs externas correm SEMPRE, sem condição                    │
-  │                                                                         │
-  │ BUG 2 (CRÍTICO) — Condição `should_check_apis` suprimia APIs           │
-  │   ANTES:  Activadas só se score > 5 OU ml >= 40 OU not blacklisted     │
-  │           → URL com h=0, ml=0: APIs nunca corriam                      │
-  │   AGORA:  Blacklists + APIs correm SEMPRE em paralelo, sem condição    │
-  │                                                                         │
-  │ BUG 3 — Score final diluía detecções individuais fortes                │
-  │   ANTES:  Média ponderada podia dar 20 mesmo com api_score=90          │
-  │   AGORA:  final_score = max(média_ponderada, TODAS_as_fontes)          │
-  │                                                                         │
-  │ BUG 4 — Blacklists e APIs corriam sequencialmente                      │
-  │   AGORA:  asyncio.gather → Blacklists + APIs + ML em PARALELO          │
-  │           Latência: de ~30s sequencial para ~15s paralelo              │
-  └─────────────────────────────────────────────────────────────────────────┘
-
-PIPELINE DE ANÁLISE v4.0 — análise híbrida verdadeira:
-  Fase A (síncrono, <1 ms):  Heurísticas locais (estrutura da URL)
-  Fase B (paralelo ~1-5s):   evaluate_domain (typosquatting) + ML classifier
-  Fase C (paralelo ~5-18s):  PhishTank/OpenPhish + VirusTotal/GSB/URLScan
-
-SCORE FINAL (lógica de máximo garantido):
-  • final_score = max(média_ponderada, h_score, ml_score, bl_score, api_score)
-  • Nenhuma fonte forte é diluída pelas restantes.
-  • Blacklist ≥ 90 → score final = max(bl_score, api_score).
+CORRECÇÕES v5.0:
+  - Usa analyze_url() DIRECTAMENTE do url_analyzer (não orquestrador antigo)
+  - Heurísticas locais melhoradas para detectar wixstudio.com, netlify.app, etc.
+  - Detecção de hosting gratuito (wixstudio.com, netlify.app, github.io, etc.)
+  - Score mínimo para URLs suspeitas (nunca retorna 0 para domínios de phishing conhecidos)
+  - Blacklist (PhishTank/URLhaus/OpenPhish) tem prioridade máxima
 """
 
 from __future__ import annotations
@@ -53,60 +29,53 @@ from pydantic import BaseModel, field_validator
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Extension"])
 
-# ─── Imports defensivos ───────────────────────────────────────────
+# ─── Imports correctos (usar url_analyzer corrigido) ─────────────
+
+# IMPORTANTE: Usar a função analyze_url do url_analyzer (async)
+try:
+    from backend.services.url_analyzer import analyze_url
+    _HAS_URL_ANALYZER = True
+    logger.info("url_analyzer.analyze_url importado com sucesso ✓")
+except ImportError as e:
+    logger.error(f"FALHA ao importar url_analyzer: {e}")
+    _HAS_URL_ANALYZER = False
 
 try:
-    from backend.services.external_apis import (
-        combined_url_reputation,
-        phishing_blacklist_check,
-    )
-    _HAS_EXTERNAL_APIS = True
-    _HAS_BLACKLIST     = True
-    logger.info("external_apis carregado ✓")
-except ImportError as _e:
-    _HAS_EXTERNAL_APIS = False
-    _HAS_BLACKLIST     = False
-    logger.warning("external_apis não disponível: %s", _e)
+    from backend.services.external_apis import phishing_blacklist_check
+    _HAS_BLACKLIST = True
+    logger.info("external_apis.phishing_blacklist_check importado ✓")
+except ImportError as e:
+    logger.error(f"FALHA ao importar external_apis: {e}")
+    _HAS_BLACKLIST = False
 
 try:
     from backend.services.ml_url_classifier import analyze_url_with_ml
     _HAS_ML = True
-    logger.info("ml_url_classifier carregado ✓")
-except ImportError as _e:
+    logger.info("ml_url_classifier importado ✓")
+except ImportError as e:
+    logger.warning(f"ml_url_classifier não disponível: {e}")
     _HAS_ML = False
-    logger.warning("ml_url_classifier não disponível: %s", _e)
-
-try:
-    from backend.services.heuristics import evaluate_domain
-    _HAS_HEURISTICS = True
-except ImportError:
-    _HAS_HEURISTICS = False
 
 try:
     from backend.core.config import settings as _cfg
     _HAS_SETTINGS = True
 except ImportError:
-    _cfg          = None
+    _cfg = None
     _HAS_SETTINGS = False
 
 # ─── Configuração ─────────────────────────────────────────────────
 
 _BACKEND_PUBLIC_URL = "http://10.249.221.68:8000"
-_CHROME_STORE_ID    = ""
-_CHROME_STORE_URL   = (
-    f"https://chrome.google.com/webstore/detail/{_CHROME_STORE_ID}"
-    if _CHROME_STORE_ID else ""
-)
 
 # ─── Rate limiting ────────────────────────────────────────────────
 
 _rate_limit: dict[str, list[float]] = {}
 _RATE_WINDOW = 60.0
-_RATE_MAX    = 60
+_RATE_MAX = 60
 
 
 def _check_rate_limit(ip: str) -> bool:
-    now  = time.monotonic()
+    now = time.monotonic()
     hits = [t for t in _rate_limit.get(ip, []) if now - t < _RATE_WINDOW]
     if len(hits) >= _RATE_MAX:
         _rate_limit[ip] = hits
@@ -127,7 +96,7 @@ def _cache_key(url: str) -> str:
 
 
 def _cache_get(url: str) -> Optional[dict]:
-    k     = _cache_key(url)
+    k = _cache_key(url)
     entry = _result_cache.get(k)
     if not entry:
         return None
@@ -149,15 +118,15 @@ def _cache_set(url: str, result: dict) -> None:
 # ─── Estatísticas ─────────────────────────────────────────────────
 
 _stats: dict = {
-    "total_checks":   0,
+    "total_checks": 0,
     "phishing_found": 0,
-    "suspicious":     0,
-    "safe":           0,
-    "cache_hits":     0,
-    "api_errors":     0,
+    "suspicious": 0,
+    "safe": 0,
+    "cache_hits": 0,
+    "api_errors": 0,
     "blacklist_hits": 0,
-    "ml_detections":  0,
-    "started_at":     datetime.now(tz=timezone.utc).isoformat(),
+    "ml_detections": 0,
+    "started_at": datetime.now(tz=timezone.utc).isoformat(),
 }
 
 # ─── Modelos Pydantic ─────────────────────────────────────────────
@@ -193,16 +162,7 @@ class CheckUrlsRequest(BaseModel):
         return [u.strip() for u in v if u.strip()]
 
 
-class UrlCheckResult(BaseModel):
-    url:     str
-    score:   int
-    verdict: str
-    reasons: List[str]
-    cached:  bool = False
-    error:   Optional[str] = None
-
-
-# ─── Heurísticas locais ───────────────────────────────────────────
+# ─── Heurísticas locais MELHORADAS v5.0 ───────────────────────────
 
 _SUSPICIOUS_TLDS = {
     ".xyz", ".tk", ".ml", ".ga", ".cf", ".gq", ".pw",
@@ -212,184 +172,187 @@ _SUSPICIOUS_TLDS = {
     ".shop", ".store", ".vip", ".bid", ".stream",
 }
 
+# Hosting gratuito SUSPEITO (muito usado em phishing)
+_SUSPICIOUS_HOSTING = {
+    "wixstudio.com", "wixsite.com", "wix.com",
+    "netlify.app", "netlify.com",
+    "github.io", "github.com",
+    "vercel.app", "pages.dev",
+    "glitch.me", "replit.co",
+    "000webhost.com", "000webhostapp.com",
+    "weebly.com", "webs.com",
+    "firebaseapp.com", "web.app",
+    "herokuapp.com", "ngrok.io", "ngrok-free.app",
+}
+
 _BANK_KEYWORDS = {
     "multicaixa", "bai", "bfa", "bca", "unitel", "bna",
     "angola", "kwanza", "atlantico", "standard", "emis",
+    "paypal", "apple", "google", "microsoft", "amazon",
+    "netflix", "dhl", "fedex", "banco", "bank",
 }
+
 _ACTION_KEYWORDS = {
     "login", "signin", "account", "verify", "confirm",
     "secure", "update", "password", "reset", "wallet",
     "banking", "payment", "credential", "validate",
+    "activate", "blocked", "suspended", "verify-now",
+    "confirm-identity", "security-check",
 }
 
 
 def _local_heuristics(url: str) -> tuple[int, list[str]]:
-    score   = 0
+    """Heurísticas locais melhoradas - detecta hosting gratuito suspeito."""
+    score = 0
     reasons: list[str] = []
+
     try:
         parsed = urlparse(url)
-        host   = (parsed.hostname or "").lower()
-        full   = url.lower()
+        host = (parsed.hostname or "").lower()
+        full = url.lower()
+        path = (parsed.path or "").lower()
     except Exception:
         return 0, []
 
+    # HTTP não seguro
     if url.startswith("http://"):
         score += 15
-        reasons.append("Ligação HTTP não encriptada")
+        reasons.append("Ligação HTTP não encriptada (MITM risk)")
 
+    # IP directo
     if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host):
         score += 40
         reasons.append("Endereço IP usado directamente como URL")
 
+    # TLD suspeito
     for tld in _SUSPICIOUS_TLDS:
         if host.endswith(tld):
             score += 25
             reasons.append(f"TLD suspeito: {tld}")
             break
 
+    # ⭐ HOSTING GRATUITO SUSPEITO (NOVO - detecta wixstudio.com)
+    for h in _SUSPICIOUS_HOSTING:
+        if h in host:
+            score += 35
+            reasons.append(f"Hosting gratuito frequentemente usado em phishing: {h}")
+            break
+
+    # Símbolo '@' na URL (credential harvesting)
     if "@" in (parsed.path or "") or "@" in (parsed.netloc or ""):
         score += 35
-        reasons.append("Símbolo '@' detectado na URL")
+        reasons.append("Símbolo '@' detectado na URL (possível credential harvesting)")
 
+    # Muitos hífens no domínio
     if host.count("-") >= 3:
         score += 15
         reasons.append(f"Domínio com {host.count('-')} hífens (suspeito)")
 
+    # Domínio muito longo
     if len(host) > 45:
         score += 15
         reasons.append(f"Domínio anormalmente longo ({len(host)} caracteres)")
 
-    if any(k in full for k in _BANK_KEYWORDS) and any(k in full for k in _ACTION_KEYWORDS):
+    # Combinação de marca bancária + acção (phishing clássico)
+    has_bank = any(k in full for k in _BANK_KEYWORDS)
+    has_action = any(k in full for k in _ACTION_KEYWORDS)
+    if has_bank and has_action:
         score += 30
-        reasons.append("URL combina marca bancária angolana com acção de autenticação")
+        reasons.append("URL combina marca com acção de autenticação (phishing típico)")
 
+    # Muitos subdomínios
     parts = host.split(".")
     if len(parts) > 4:
         score += 10
         reasons.append(f"Muitos subdomínios ({len(parts) - 2} níveis)")
 
-    for h in {"ngrok.io", "ngrok-free.app", "netlify.app", "github.io",
-               "vercel.app", "pages.dev", "glitch.me", "replit.co",
-               "000webhost.com", "weebly.com", "wixsite.com"}:
-        if h in host:
-            score += 30
-            reasons.append(f"Hosting gratuito suspeito: {h}")
-            break
+    # Palavras de phishing no path
+    phishing_path_words = [
+        "login", "signin", "account", "verify", "confirm",
+        "secure", "update", "banking", "password",
+    ]
+    found_words = [w for w in phishing_path_words if w in path]
+    if len(found_words) >= 2:
+        score += 20
+        reasons.append(f"Palavras de phishing no path: {', '.join(found_words[:3])}")
 
     return min(100, score), reasons
 
 
-# ─── Wrappers seguros (nunca lançam excepção) ─────────────────────
-# Cada wrapper captura TUDO e devolve um dict neutro em caso de falha.
-# Garante que uma API lenta/offline nunca cancela as restantes.
+# ─── Wrappers seguros ─────────────────────────────────────────────
 
-async def _safe_ml(url: str) -> dict:
-    """ML URL Classifier (RandomForest + XGBoost) — sempre tentado."""
-    if not _HAS_ML:
-        return {"ml_score": 0, "reasons": [], "method": "unavailable"}
-    try:
-        return await asyncio.wait_for(analyze_url_with_ml(url), timeout=6.0)
-    except asyncio.TimeoutError:
-        logger.debug("ML timeout: %s", url[:60])
-        return {"ml_score": 0, "reasons": [], "method": "timeout"}
-    except Exception as exc:
-        logger.debug("ML erro: %s", exc)
-        return {"ml_score": 0, "reasons": [], "method": "error"}
+async def _safe_analyze_url(url: str) -> dict:
+    """Usa a função analyze_url do url_analyzer (versão corrigida v8)."""
+    if not _HAS_URL_ANALYZER:
+        # Fallback: heurísticas locais apenas
+        h_score, h_reasons = _local_heuristics(url)
+        score = h_score
+        reasons = h_reasons
+        if not reasons:
+            reasons = ["url_analyzer_indisponível"]
+    else:
+        try:
+            result = await asyncio.wait_for(analyze_url(url), timeout=30.0)
+            score = result.get("score", 0)
+            reasons = result.get("reasons", [])
+        except asyncio.TimeoutError:
+            logger.warning(f"analyze_url timeout para {url[:60]}")
+            h_score, h_reasons = _local_heuristics(url)
+            score = h_score
+            reasons = h_reasons + ["analysis_timeout"]
+        except Exception as e:
+            logger.error(f"analyze_url falhou para {url[:60]}: {e}")
+            h_score, h_reasons = _local_heuristics(url)
+            score = h_score
+            reasons = h_reasons + [f"analysis_error: {type(e).__name__}"]
+
+    return {"score": score, "reasons": reasons}
 
 
 async def _safe_blacklists(url: str) -> dict:
-    """PhishTank + OpenPhish — SEMPRE executados, sem condição."""
+    """Verifica blacklists (PhishTank/URLhaus/OpenPhish) com timeout."""
     if not _HAS_BLACKLIST:
-        return {"score": 0, "reasons": [], "blacklisted": False,
-                "phishtank": {}, "openphish": {}, "source": "unavailable"}
+        return {"blacklisted": False, "score": 0, "reasons": []}
+
     try:
-        result = await asyncio.wait_for(phishing_blacklist_check(url), timeout=14.0)
+        result = await asyncio.wait_for(phishing_blacklist_check(url), timeout=15.0)
         return result
     except asyncio.TimeoutError:
-        logger.warning("Blacklists timeout: %s", url[:60])
-        return {"score": 0, "reasons": ["Blacklists: timeout — resultado parcial"],
-                "blacklisted": False, "phishtank": {}, "openphish": {}, "source": "timeout"}
-    except Exception as exc:
-        logger.warning("Blacklists erro: %s", exc)
-        _stats["api_errors"] += 1
-        return {"score": 0, "reasons": [], "blacklisted": False,
-                "phishtank": {}, "openphish": {}, "source": "error"}
+        logger.warning(f"Blacklist timeout para {url[:60]}")
+        return {"blacklisted": False, "score": 0, "reasons": ["blacklist_timeout"]}
+    except Exception as e:
+        logger.warning(f"Blacklist falhou para {url[:60]}: {e}")
+        return {"blacklisted": False, "score": 0, "reasons": [f"blacklist_error: {type(e).__name__}"]}
 
 
-async def _safe_external_apis(url: str) -> dict:
-    """
-    VirusTotal + Google Safe Browsing + URLScan — SEMPRE executados, sem condição.
+async def _safe_ml(url: str) -> dict:
+    """ML URL classifier com timeout."""
+    if not _HAS_ML:
+        return {"ml_score": 0, "reasons": []}
 
-    combined_url_reputation() corre PhishTank + OpenPhish + VT + GSB + URLScan
-    internamente em paralelo. Usamos o seu resultado para VT/GSB/URLScan;
-    os scores de PhishTank/OpenPhish vêm de _safe_blacklists() separado para
-    termos os dois scores independentes no cálculo final.
-    """
-    if not _HAS_EXTERNAL_APIS:
-        return {"score": 0, "reasons": [], "apis_positive": 0,
-                "malicious": False, "blacklisted": False, "source": "unavailable"}
     try:
-        result = await asyncio.wait_for(combined_url_reputation(url), timeout=20.0)
+        result = await asyncio.wait_for(analyze_url_with_ml(url), timeout=10.0)
         return result
     except asyncio.TimeoutError:
-        logger.info("APIs externas timeout: %s", url[:60])
-        return {"score": 0, "reasons": ["APIs externas (VT/GSB/URLScan): timeout"],
-                "apis_positive": 0, "malicious": False, "blacklisted": False, "source": "timeout"}
-    except Exception as exc:
-        logger.warning("APIs externas erro: %s", exc)
-        _stats["api_errors"] += 1
-        return {"score": 0, "reasons": [], "apis_positive": 0,
-                "malicious": False, "blacklisted": False, "source": "error"}
+        logger.debug(f"ML timeout para {url[:60]}")
+        return {"ml_score": 0, "reasons": ["ml_timeout"]}
+    except Exception as e:
+        logger.debug(f"ML falhou para {url[:60]}: {e}")
+        return {"ml_score": 0, "reasons": []}
 
 
-async def _safe_heuristics_advanced(url: str) -> tuple[int, list[str]]:
-    """evaluate_domain — typosquatting e brand spoofing avançado."""
-    if not _HAS_HEURISTICS:
-        return 0, []
-    try:
-        domain_result = await asyncio.wait_for(evaluate_domain(url, []), timeout=3.0)
-        adv_score   = 0
-        adv_reasons: list[str] = []
-        if getattr(domain_result, "typosquatting_detected", False):
-            adv_score += 50
-            brand = getattr(domain_result, "suspected_brand", "desconhecida")
-            adv_reasons.append(f"Typosquatting: domínio imita '{brand}'")
-        if getattr(domain_result, "official_match", True) is False:
-            brand = getattr(domain_result, "suspected_brand", None)
-            if brand:
-                adv_score += 20
-                adv_reasons.append(f"Marca '{brand}' em domínio não oficial")
-        return adv_score, adv_reasons
-    except Exception as exc:
-        logger.debug("evaluate_domain falhou: %s", exc)
-        return 0, []
+# ─── Pipeline principal de análise v5.0 ──────────────────────────
 
-
-# ─── Pipeline principal de análise v4.0 ──────────────────────────
-
-async def _analyze_url(url: str) -> dict:
+async def _analyze_url_v5(url: str) -> dict:
     """
-    Pipeline híbrido v4.0 — TODAS as fontes sempre activas.
-
-    Fase A (síncrono, <1 ms):
-      • Heurísticas locais (estrutura da URL)
-
-    Fase B (paralelo, ~1-5s):
-      • evaluate_domain (typosquatting)
-      • ML URL Classifier (RandomForest + XGBoost)
-
-    Fase C (paralelo, ~5-20s — a fase mais importante):
-      • _safe_blacklists()     → PhishTank + OpenPhish (SEMPRE)
-      • _safe_external_apis()  → VT + GSB + URLScan    (SEMPRE)
-
-    CORRECÇÃO PRINCIPAL: as Fases B e C correm SEMPRE para QUALQUER URL,
-    independentemente do score heurístico. Não há condições de activação.
-
-    Score final:
-      • final_score = max(média_ponderada, h, ml, bl, api)
-      • Uma fonte a detectar claramente nunca é diluída pelas restantes.
+    Pipeline v5.0:
+      1. Cache
+      2. Heurísticas locais (rápidas)
+      3. Blacklists (PhishTank/URLhaus/OpenPhish) - PRIORIDADE MÁXIMA
+      4. ML URL classifier
+      5. analyze_url (completo)
+      6. Score final com lógica de máximo
     """
-    # ── 1. Cache ─────────────────────────────────────────────────
     cached = _cache_get(url)
     if cached:
         _stats["cache_hits"] += 1
@@ -397,85 +360,52 @@ async def _analyze_url(url: str) -> dict:
 
     t0 = time.monotonic()
 
-    # ── Fase A: heurísticas locais (síncrono, <1 ms) ─────────────
+    # 1. Heurísticas locais (rápidas)
     h_score, h_reasons = _local_heuristics(url)
 
-    # ── Fase B: heurísticas avançadas + ML em paralelo ────────────
-    (adv_score, adv_reasons), ml_result = await asyncio.gather(
-        _safe_heuristics_advanced(url),
-        _safe_ml(url),
+    # 2. Blacklists em paralelo com ML e analyze_url
+    bl_task = _safe_blacklists(url)
+    ml_task = _safe_ml(url)
+    analyzer_task = _safe_analyze_url(url)
+
+    bl_result, ml_result, analyzer_result = await asyncio.gather(
+        bl_task, ml_task, analyzer_task
     )
 
-    ml_score   = ml_result.get("ml_score", 0)
+    bl_score = bl_result.get("score", 0)
+    bl_blacklisted = bl_result.get("blacklisted", False)
+    bl_reasons = bl_result.get("reasons", [])
+
+    ml_score = ml_result.get("ml_score", 0)
     ml_reasons = ml_result.get("reasons", [])
 
-    # Combinar score heurístico com avançado
-    h_score   = min(100, h_score + adv_score)
-    h_reasons = h_reasons + adv_reasons
+    analyzer_score = analyzer_result.get("score", 0)
+    analyzer_reasons = analyzer_result.get("reasons", [])
 
-    # ── Fase C: Blacklists + APIs externas em PARALELO ───────────
-    # CORRECÇÃO PRINCIPAL:
-    #   • Sem `should_check_apis` condicional
-    #   • Sem `not blacklisted` a bloquear as APIs externas
-    #   • Ambas correm SEMPRE, seja qual for o score das fases anteriores
-    bl_result, api_result = await asyncio.gather(
-        _safe_blacklists(url),
-        _safe_external_apis(url),
-    )
-
-    bl_score    = bl_result.get("score", 0)
-    bl_reasons  = bl_result.get("reasons", [])
-    blacklisted = bl_result.get("blacklisted", False)
-
-    api_score   = api_result.get("score", 0)
-    api_reasons = api_result.get("reasons", [])
-
-    # Actualizar estatísticas
-    if blacklisted:
+    # ⭐ PRIORIDADE MÁXIMA: Blacklist confirmada
+    if bl_blacklisted:
+        final_score = max(bl_score, 85)
+        reasons = bl_reasons.copy()
+        logger.info(f"BLACKLIST HIT: {url[:60]} → score={final_score}")
         _stats["blacklist_hits"] += 1
-        logger.info("BLACKLIST HIT: %s → bl_score=%d api_score=%d",
-                    url[:60], bl_score, api_score)
-
-    if ml_score >= 60:
-        _stats["ml_detections"] += 1
-
-    # ── Calcular score final ──────────────────────────────────────
-    # Regra: nenhuma fonte forte é diluída pela média das outras.
-
-    if blacklisted and bl_score >= 90:
-        # Blacklist confirmada → score final é o máximo (API pode ser ainda maior)
-        final_score = int(max(bl_score, api_score))
     else:
-        # Média ponderada híbrida:
-        #   heurísticas   25%  (estruturais, rápidas)
-        #   ML            30%  (comportamental, local)
-        #   blacklists    20%  (PhishTank + OpenPhish)
-        #   APIs externas 25%  (VT + GSB + URLScan)
+        # Média ponderada
         weighted = (
-            h_score   * 0.25 +
-            ml_score  * 0.30 +
-            bl_score  * 0.20 +
-            api_score * 0.25
+            h_score * 0.20 +      # heurísticas locais
+            ml_score * 0.25 +     # ML
+            analyzer_score * 0.35 +  # analyze_url (contém WHOIS, crawler, etc.)
+            bl_score * 0.20       # blacklist score (mesmo sem confirmado)
         )
-        # Garantir que nenhuma fonte forte é ignorada
-        # (ml_score só entra no max se >= 60, para não inflar scores marginais)
-        final_score = int(max(
-            weighted,
-            h_score,
-            ml_score if ml_score >= 60 else 0,
-            bl_score,
-            api_score,
-        ))
+        final_score = int(max(weighted, h_score, ml_score, analyzer_score, bl_score))
+        reasons = list(dict.fromkeys(h_reasons + ml_reasons + analyzer_reasons + bl_reasons))
 
     final_score = min(100, max(0, final_score))
 
-    # ── Agregar razões (sem duplicados, prioridade: bl > api > ml > h) ──
-    seen: set[str] = set()
-    all_reasons: list[str] = []
-    for r in (*bl_reasons, *api_reasons, *ml_reasons, *h_reasons):
-        if r not in seen:
-            seen.add(r)
-            all_reasons.append(r)
+    # Se score baixo mas hosting suspeito, aumentar ligeiramente
+    if final_score < 30 and any(h in url.lower() for h in _SUSPICIOUS_HOSTING):
+        final_score = max(final_score, 25)
+        if "hosting_suspeito" not in str(reasons):
+            reasons.append("Domínio em hosting gratuito frequentemente usado em phishing")
 
     verdict = (
         "NÃO SEGURO" if final_score >= 60
@@ -490,9 +420,9 @@ async def _analyze_url(url: str) -> dict:
         host_label = url
 
     logger.info(
-        "Check v4: %s → %d (%s) | h=%d ml=%d bl=%d api=%d | %.2fs",
+        "Check v5: %s → %d (%s) | h=%d ml=%d analyzer=%d bl=%d | %.2fs",
         host_label, final_score, verdict,
-        h_score, ml_score, bl_score, api_score, elapsed,
+        h_score, ml_score, analyzer_score, bl_score, elapsed,
     )
 
     _stats["total_checks"] += 1
@@ -503,23 +433,28 @@ async def _analyze_url(url: str) -> dict:
     else:
         _stats["safe"] += 1
 
+    # Actualizar estatísticas de ML
+    if ml_score >= 60:
+        _stats["ml_detections"] += 1
+
     result = {
-        "url":         url,
-        "score":       final_score,
-        "verdict":     verdict,
-        "reasons":     all_reasons,
-        "cached":      False,
-        "blacklisted": blacklisted,
-        "ml_score":    ml_score,
+        "url": url,
+        "score": final_score,
+        "verdict": verdict,
+        "reasons": reasons[:15],  # limitar razões
+        "cached": False,
+        "blacklisted": bl_blacklisted,
+        "ml_score": ml_score,
         "details": {
-            "heuristic_score":  h_score,
-            "ml_score":         ml_score,
-            "blacklist_score":  bl_score,
-            "api_score":        api_score,
-            "elapsed_seconds":  round(elapsed, 2),
-            "pipeline_version": "4.0",
+            "heuristic_score": h_score,
+            "ml_score": ml_score,
+            "analyzer_score": analyzer_score,
+            "blacklist_score": bl_score,
+            "elapsed_seconds": round(elapsed, 2),
+            "pipeline_version": "5.0",
         },
     }
+
     _cache_set(url, result)
     return result
 
@@ -528,7 +463,7 @@ async def _analyze_url(url: str) -> dict:
 
 def _cors() -> dict:
     return {
-        "Access-Control-Allow-Origin":  "*",
+        "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type",
     }
@@ -544,28 +479,24 @@ async def options_preflight():
 
 @router.post("/check-url")
 async def check_url_endpoint(body: CheckUrlRequest, request: Request):
-    """
-    Verificar uma URL individual — pipeline híbrido v4.0.
-
-    Fontes activas SEMPRE (em paralelo):
-      Heurísticas + ML + PhishTank + OpenPhish + VirusTotal + GSB + URLScan
-    Score 0–29 → SEGURO | 30–59 → SUSPEITO | 60+ → NÃO SEGURO
-    """
+    """Verificar uma URL individual — pipeline v5.0."""
     client_ip = request.client.host if request.client else "unknown"
     if not _check_rate_limit(client_ip):
         raise HTTPException(status_code=429, detail="Rate limit excedido. Aguarde 1 minuto.")
 
     try:
-        result = await _analyze_url(body.url)
+        result = await _analyze_url_v5(body.url)
         return JSONResponse(content=result, headers=_cors())
     except Exception as exc:
-        logger.error("Erro em /check-url: %s", exc, exc_info=True)
+        logger.error(f"Erro em /check-url: {exc}", exc_info=True)
         return JSONResponse(
             content={
-                "url": body.url, "score": 0,
+                "url": body.url,
+                "score": 0,
                 "verdict": "ERRO",
-                "reasons": ["Erro interno — URL não verificada"],
-                "error": str(exc), "cached": False,
+                "reasons": [f"Erro interno: {str(exc)[:100]}"],
+                "error": str(exc),
+                "cached": False,
             },
             headers=_cors(),
         )
@@ -580,12 +511,16 @@ async def check_urls_batch(body: CheckUrlsRequest, request: Request):
 
     async def _safe_check(url: str):
         try:
-            return url, await _analyze_url(url)
+            return url, await _analyze_url_v5(url)
         except Exception as exc:
-            logger.warning("Batch falhou para %s: %s", url, exc)
+            logger.warning(f"Batch falhou para {url}: {exc}")
             return url, {
-                "url": url, "score": 0, "verdict": "SEGURO",
-                "reasons": [], "error": str(exc), "cached": False,
+                "url": url,
+                "score": 0,
+                "verdict": "SEGURO",
+                "reasons": [f"Erro: {str(exc)[:50]}"],
+                "cached": False,
+                "blacklisted": False,
             }
 
     results = await asyncio.gather(*[_safe_check(u) for u in body.urls[:20]])
@@ -599,7 +534,7 @@ async def get_stats():
         content={
             **_stats,
             "cache_size": len(_result_cache),
-            "timestamp":  datetime.now(tz=timezone.utc).isoformat(),
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
         },
         headers=_cors(),
     )
@@ -617,33 +552,27 @@ async def extension_status():
         return "no_api_key"
 
     apis_status = {
-        "virustotal":    _key_ok("VIRUSTOTAL_API_KEY"),
-        "safe_browsing": _key_ok("GOOGLE_SAFE_BROWSING_API_KEY"),
-        "urlscan":       _key_ok("URLSCAN_API_KEY", "URLSCAN_API"),
-        "abuseipdb":     _key_ok("ABUSEIPDB_API_KEY"),
-        "phishtank":     "configured",           # gratuito, sempre activo
-        "openphish":     "configured",           # gratuito, sempre activo
+        "url_analyzer": "configured" if _HAS_URL_ANALYZER else "unavailable",
+        "blacklist": "configured" if _HAS_BLACKLIST else "unavailable",
         "ml_classifier": "configured" if _HAS_ML else "not_installed",
+        "virustotal": _key_ok("VIRUSTOTAL_API_KEY"),
+        "safe_browsing": _key_ok("GOOGLE_SAFE_BROWSING_API_KEY"),
+        "abuseipdb": _key_ok("ABUSEIPDB_API_KEY"),
     }
-    apis_configured = sum(1 for v in apis_status.values() if v == "configured")
 
     return JSONResponse(
         content={
-            "backend_url":            _BACKEND_PUBLIC_URL,
-            "check_url_endpoint":     f"{_BACKEND_PUBLIC_URL}/extension/check-url",
-            "chrome_store_url":       _CHROME_STORE_URL,
-            "chrome_store_available": bool(_CHROME_STORE_ID),
-            "backend_online":         True,
-            "apis_configured":        apis_configured,
-            "apis_total":             len(apis_status),
-            "apis_status":            apis_status,
-            "total_checks":           _stats["total_checks"],
-            "phishing_blocked":       _stats["phishing_found"],
-            "blacklist_hits":         _stats["blacklist_hits"],
-            "ml_detections":          _stats["ml_detections"],
-            "cache_entries":          len(_result_cache),
-            "pipeline_version":       "4.0",
-            "timestamp":              datetime.now(tz=timezone.utc).isoformat(),
+            "backend_url": _BACKEND_PUBLIC_URL,
+            "check_url_endpoint": f"{_BACKEND_PUBLIC_URL}/extension/check-url",
+            "backend_online": True,
+            "apis_status": apis_status,
+            "total_checks": _stats["total_checks"],
+            "phishing_blocked": _stats["phishing_found"],
+            "blacklist_hits": _stats["blacklist_hits"],
+            "ml_detections": _stats["ml_detections"],
+            "cache_entries": len(_result_cache),
+            "pipeline_version": "5.0",
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
         },
         headers=_cors(),
     )
@@ -651,39 +580,17 @@ async def extension_status():
 
 @router.get("/health")
 async def extension_health():
-    """Health check rápido — não faz chamadas de rede."""
-    def _key_ok(*attrs: str) -> str:
-        if not _HAS_SETTINGS or _cfg is None:
-            return "settings_unavailable"
-        for attr in attrs:
-            if getattr(_cfg, attr, None):
-                return "configured"
-        return "no_api_key"
-
-    apis = {
-        "virustotal":    _key_ok("VIRUSTOTAL_API_KEY"),
-        "safe_browsing": _key_ok("GOOGLE_SAFE_BROWSING_API_KEY"),
-        "urlscan":       _key_ok("URLSCAN_API_KEY", "URLSCAN_API"),
-        "abuseipdb":     _key_ok("ABUSEIPDB_API_KEY"),
-        "phishtank":     "configured",
-        "openphish":     "configured",
-        "ml_classifier": "configured" if _HAS_ML else "not_installed",
-    }
-
+    """Health check rápido."""
     return JSONResponse(
         content={
-            "status":         "ok",
-            "version":        "4.0.0",
-            "pipeline":       "heuristics+ml ∥ blacklists+external_apis",
-            "apis":           apis,
-            "all_configured": all(v == "configured" for v in apis.values()),
-            "has_ml":         _HAS_ML,
-            "has_blacklist":  _HAS_BLACKLIST,
-            "has_external":   _HAS_EXTERNAL_APIS,
-            "cache_entries":  len(_result_cache),
-            "heuristics_ok":  True,
-            "backend_url":    _BACKEND_PUBLIC_URL,
-            "stats":          _stats,
+            "status": "ok",
+            "version": "5.0.0",
+            "pipeline": "heuristics + blacklist + ml + analyzer",
+            "has_url_analyzer": _HAS_URL_ANALYZER,
+            "has_blacklist": _HAS_BLACKLIST,
+            "has_ml": _HAS_ML,
+            "cache_entries": len(_result_cache),
+            "stats": _stats,
         },
         headers=_cors(),
     )
