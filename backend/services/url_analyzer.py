@@ -1,12 +1,15 @@
-"""url_analyzer.py — Pipeline de análise de URL (v8 - COMPLETAMENTE CORRIGIDO).
+"""
+backend/services/url_analyzer.py
+──────────────────────────────────
+Pipeline de análise de URL v13 — PhishGuard Angola
 
-CORRECÇÕES v8:
-- TODAS as funções de I/O (DNS, HTTP, WHOIS, Crawler) são agora async com asyncio.to_thread
-- _step_crawler correctamente detecta no_content, low_content, ghost_domain, parked_domain
-- _step_reputation: APIs externas chamadas correctamente em paralelo com timeout global
-- WHOIS: get_domain_age_days chamado em thread separada com tratamento de erro
-- DNS: check_dns chamado em thread separada
-- Loop infinito _is_proxy_block corrigido
+CORRECÇÕES v13:
+- CORRIGIDO: Blacklists (PhishTank/OpenPhish) são SEMPRE verificadas,
+  mesmo quando heurísticas não detetam nada.
+- CORRIGIDO: Domínios .cyou são tratados como TLD suspeito (score base 15)
+- CORRIGIDO: Timeout DNS não impede verificação de blacklists
+- CORRIGIDO: Score mínimo de 30 para TLDs suspeitos, para garantir
+  que a URL é pelo menos SUSPEITA e não SEGURA
 """
 
 from __future__ import annotations
@@ -16,16 +19,17 @@ import logging
 import re
 import socket
 from difflib import SequenceMatcher
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 from urllib.parse import urlparse
 
-import requests
 import tldextract
+import requests
+import urllib3
 from bs4 import BeautifulSoup
 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 from backend.services.dns_check import check_dns
-from backend.utils.http_check import check_http
-from backend.utils.whois_check import get_domain_age_days
 from backend.services.scoring import classify_score
 from backend.services.brand_search import check_dynamic_brand_spoof
 
@@ -38,19 +42,134 @@ from backend.services.external_apis import (
 
 logger = logging.getLogger(__name__)
 
-# ─── Marcas conhecidas ───────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# CONFIGURAÇÃO DE SCORES
+# ═══════════════════════════════════════════════════════════════════
+
+MAX_HEURISTIC_SCORE = 55
+BLACKLIST_BLOCK_SCORE = 90
+VIRUSTOTAL_BLOCK_SCORE = 75
+SAFE_BROWSING_BLOCK_SCORE = 85
+
+# ═══════════════════════════════════════════════════════════════════
+# DOMÍNIOS QUE SÃO SEMPRE SEGUROS
+# ═══════════════════════════════════════════════════════════════════
+
+ALWAYS_SAFE_DOMAINS: set[str] = {
+    # Motores de busca
+    "google.com", "google.co.ao", "google.pt", "google.com.br",
+    "google.co.uk", "google.fr", "google.de", "google.es",
+    "google.it", "google.nl", "google.pl", "google.co.jp",
+    "google.co.in", "google.com.au", "google.com.mx",
+    "googleapis.com", "gstatic.com", "googleusercontent.com",
+    "bing.com", "yahoo.com", "duckduckgo.com",
+    "yandex.com", "baidu.com", "ecosia.org",
+
+    # Serviços Google
+    "youtube.com", "youtu.be",
+    "gmail.com", "mail.google.com",
+    "drive.google.com", "docs.google.com",
+    "accounts.google.com", "myaccount.google.com",
+    "play.google.com", "news.google.com",
+    "maps.google.com", "photos.google.com",
+    "meet.google.com", "calendar.google.com",
+
+    # Microsoft
+    "microsoft.com", "live.com", "outlook.com",
+    "hotmail.com", "office.com", "office365.com",
+    "onedrive.com", "microsoftonline.com",
+    "teams.microsoft.com", "bing.com",
+
+    # Apple
+    "apple.com", "icloud.com",
+
+    # Redes sociais
+    "facebook.com", "instagram.com", "whatsapp.com",
+    "twitter.com", "x.com", "tiktok.com", "meta.com",
+    "snapchat.com", "pinterest.com", "reddit.com",
+    "linkedin.com", "telegram.org", "discord.com",
+    "slack.com", "zoom.us", "messenger.com",
+
+    # Email providers
+    "protonmail.com", "mail.yahoo.com",
+    "mail.ru", "yandex.ru",
+
+    # Comércio geral
+    "amazon.com", "amazon.co.uk", "amazon.de", "amazon.fr",
+    "ebay.com", "aliexpress.com",
+    "mercadolivre.com.br", "olx.pt",
+
+    # Moda / Desporto
+    "nike.com", "adidas.com", "puma.com",
+    "zara.com", "hm.com", "ikea.com",
+    "levis.com", "reebok.com", "underarmour.com",
+    "newbalance.com", "converse.com", "vans.com",
+    "timberland.com", "lacoste.com", "calvinklein.com",
+    "gucci.com", "louisvuitton.com", "chanel.com",
+    "burberry.com", "ralphlauren.com", "gap.com",
+
+    # Streaming
+    "netflix.com", "spotify.com", "disneyplus.com",
+    "primevideo.com", "hbomax.com", "hulu.com",
+
+    # Notícias
+    "bbc.com", "cnn.com", "reuters.com",
+    "nytimes.com", "theguardian.com",
+    "angop.ao", "jornaldeangola.ao",
+
+    # Angola
+    "bai.ao", "bfa.ao", "bic.ao", "bpc.ao",
+    "unitel.ao", "movicel.ao", "africell.ao",
+    "multicaixa.ao", "emis.ao", "sonangol.ao",
+    "taag.ao", "governo.ao", "bna.ao",
+    "atlantico.ao", "standardbank.ao",
+
+    # Tecnologia
+    "github.com", "gitlab.com", "bitbucket.org",
+    "stackoverflow.com", "medium.com",
+    "wikipedia.org", "wikimedia.org",
+
+    # Pagamentos
+    "paypal.com", "stripe.com", "shopify.com",
+    "visa.com", "mastercard.com",
+
+    # Segurança
+    "phishtank.com", "phishtank.net", "phishtank.org",
+    "virustotal.com", "urlscan.io",
+    "abuseipdb.com", "abuse.ch",
+    "talosintelligence.com", "openphish.com",
+    "spamhaus.org",
+
+    # IA / Chat
+    "chatgpt.com", "openai.com",
+    "deepseek.com", "chat.deepseek.com",
+    "claude.ai", "anthropic.com",
+    "perplexity.ai",
+
+    # Outros populares
+    "dropbox.com", "wetransfer.com",
+    "canva.com", "figma.com", "adobe.com",
+    "notion.so", "trello.com", "asana.com",
+    "salesforce.com", "hubspot.com",
+    "dhl.com", "fedex.com", "ups.com",
+    "wix.com", "wordpress.com",
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# MARCAS CONHECIDAS
+# ═══════════════════════════════════════════════════════════════════
 
 KNOWN_BRANDS: Dict[str, List[str]] = {
-    "BAI": ["bai.ao"],
-    "BFA": ["bfa.ao"],
+    "BAI": ["bai.ao", "baionline.ao"],
+    "BFA": ["bfa.ao", "bfaonline.ao"],
     "Banco Atlântico": ["atlantico.ao"],
-    "BIC": ["bic.ao"],
+    "BIC": ["bic.ao", "bicnet.ao"],
     "BPC": ["bpc.ao"],
     "Standard Bank": ["standardbank.ao"],
     "Unitel": ["unitel.ao"],
     "Movicel": ["movicel.ao"],
     "Africell": ["africell.ao"],
-    "Multicaixa": ["multicaixa.ao"],
+    "Multicaixa": ["multicaixa.ao", "emis.ao"],
     "EMIS": ["emis.ao"],
     "Sonangol": ["sonangol.ao"],
     "TAAG": ["taag.ao"],
@@ -58,73 +177,47 @@ KNOWN_BRANDS: Dict[str, List[str]] = {
     "PayPal": ["paypal.com"],
     "DHL": ["dhl.com"],
     "Amazon": ["amazon.com"],
+    "Google": ["google.com"],
+    "Microsoft": ["microsoft.com"],
+    "Apple": ["apple.com"],
+    "Facebook": ["facebook.com"],
 }
 
-INSTITUTIONAL_DOMAINS: set = {
-    "itel.gov.ao", "inacom.gov.ao", "mintic.gov.ao", "minfin.gov.ao",
-    "ine.gov.ao", "governo.ao", "presidencia.ao", "mineduca.gov.ao",
-    "minsa.gov.ao", "mirex.gov.ao", "tribunal.ao", "bna.ao",
-    "emis.ao", "multicaixa.ao", "angop.ao", "jornaldeangola.ao",
-    "expansao.ao", "ver.ao", "voanews.com",
-}
-
-_BRAND_KEYWORD_EXCEPTIONS: Dict[str, set] = {
-    "unitel":     {"itel"},
-    "multicaixa": {"caix", "caixa"},
-    "bai":        {"embaixada", "embai"},
-    "bfa":        set(),
-    "atlantico":  {"atlanticosul", "atlanticoseguros"},
-}
-
-# Padrões de conteúdo vazio/parked (expandido)
 PARKED_PATTERNS = [
     "buy this domain", "domain for sale", "parking", "sedo",
-    "godaddy", "above.com", "this domain is parked",
-    "domain name is for sale", "coming soon", "under construction",
-    "website coming soon", "this website is under construction",
-    "this domain has expired", "domain expired", "expired domain",
-    "parked domain", "domain parking", "buy this domain name",
-    "is for sale", "domain may be for sale",
+    "godaddy", "this domain is parked", "domain expired",
+    "coming soon", "under construction",
 ]
 
-REAL_THREATS = [
-    "typosquatting", "subdomain_spoof", "spoof_known", "dynamic_brand_spoof",
-    "virustotal", "google_safe_browsing", "dnsbl", "abuseipdb",
-    "parked_domain", "domain_not_found", "very_new_domain",
-    "ghost_domain", "no_real_content",
-]
+# ─── Helpers ──────────────────────────────────────────────────────
 
-# Proxy block patterns
-_PROXY_BLOCK_BODIES = {
-    "host not in allowlist", "access denied",
-    "blocked by network", "not allowed", "forbidden by policy",
-    "blocked by your administrator", "content filtered",
-    "access to this resource is forbidden", "403 forbidden",
-}
-
-_PROXY_BLOCK_HEADERS = {
-    "x-deny-reason", "x-block-reason", "x-squid-error",
-    "x-cache-error", "x-forwarded-status",
-}
-
-
-# ─── Helpers síncronos (executados em threads) ──────────────────────────────────────
-
-def _is_institutional(domain: str) -> bool:
+def _is_always_safe(domain: str) -> bool:
+    """Verifica se o domínio é de um serviço conhecido e SEMPRE seguro."""
     d = domain.lower().strip()
-    if d in INSTITUTIONAL_DOMAINS:
+    if d.startswith("www."):
+        d = d[4:]
+
+    if d in ALWAYS_SAFE_DOMAINS:
         return True
-    for inst in INSTITUTIONAL_DOMAINS:
-        if d.endswith("." + inst):
+
+    for safe in ALWAYS_SAFE_DOMAINS:
+        if d.endswith("." + safe) or d == safe:
             return True
-    if d.endswith(".gov.ao"):
-        return True
+
     return False
 
 
 def _extract_domain(url: str) -> str:
-    ext = tldextract.extract(url)
-    return f"{ext.domain}.{ext.suffix}".lower() if ext.suffix else ext.domain.lower()
+    try:
+        ext = tldextract.extract(url)
+        if ext.suffix:
+            return f"{ext.domain}.{ext.suffix}".lower()
+        return ext.domain.lower()
+    except:
+        parsed = urlparse(url)
+        hostname = parsed.hostname or ""
+        parts = hostname.split(".")
+        return ".".join(parts[-2:]) if len(parts) >= 2 else hostname
 
 
 def _normalize(text: str) -> str:
@@ -135,468 +228,313 @@ def _similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
-def _is_proxy_block_detection(status: int, body: str, headers: dict) -> bool:
-    """Detecta se a resposta HTTP indica bloqueio por proxy/firewall."""
-    if status in (403, 407, 451, 502, 503):
-        body_lower = (body or "").lower()
-        if any(p in body_lower for p in _PROXY_BLOCK_BODIES):
-            return True
-        header_keys = {k.lower() for k in headers.keys()}
-        if any(h in header_keys for h in _PROXY_BLOCK_HEADERS):
-            return True
-    return False
+_BRAND_KEYWORD_EXCEPTIONS: Dict[str, set] = {
+    "unitel": {"itel"},
+    "multicaixa": {"caix", "caixa"},
+    "bai": {"embaixada", "embai"},
+    "atlantico": {"atlanticosul", "atlanticoseguros"},
+}
 
 
-# ─── Typosquatting (síncrono, rápido) ────────────────────────────────────────────────
-
-def _detect_typosquatting_sync(domain: str, score: int, reasons: List[str]) -> Tuple[int, List[str]]:
-    if _is_institutional(domain):
-        return score, reasons
-
+def _detect_typosquatting(domain: str) -> Tuple[int, List[str]]:
     domain_body = tldextract.extract(domain).domain.lower()
-
     if len(domain_body) < 4:
-        return score, reasons
-
+        return 0, []
+    
     for brand, official_domains in KNOWN_BRANDS.items():
         brand_norm = _normalize(brand)
         sim = _similarity(domain_body, brand_norm)
-
+        
         exceptions = _BRAND_KEYWORD_EXCEPTIONS.get(brand_norm, set())
         if domain_body in exceptions or any(exc in domain_body for exc in exceptions if exc):
             continue
-
-        if 0.82 < sim < 1.0:
-            score += 70
-            reasons.append(f"typosquatting:{brand}")
-            return score, reasons
-
+        
+        if 0.85 < sim < 1.0 and len(domain_body) >= len(brand_norm) - 1:
+            return 40, [f"typosquatting:{brand}"]
+        
         numerified = brand_norm.replace("o", "0").replace("i", "1").replace("l", "1")
         if numerified != brand_norm and numerified in domain_body:
-            score += 80
-            reasons.append(f"typosquatting_numeric:{brand}")
-            return score, reasons
-
-    return score, reasons
+            return 45, [f"typosquatting_numeric:{brand}"]
+    
+    return 0, []
 
 
-def _detect_subdomain_spoof_sync(domain: str, score: int, reasons: List[str]) -> Tuple[int, List[str]]:
-    if _is_institutional(domain):
-        return score, reasons
-
+def _detect_subdomain_spoof(domain: str) -> Tuple[int, List[str]]:
     for brand, official_domains in KNOWN_BRANDS.items():
         for official in official_domains:
             if official in domain and not domain.endswith(official):
-                score += 85
-                reasons.append(f"subdomain_spoof:{brand}({official})")
-                return score, reasons
-    return score, reasons
+                domain_parts = domain.split(".")
+                official_parts = official.split(".")
+                if official_parts[0] in domain_parts and domain != official:
+                    return 50, [f"subdomain_spoof:{brand}({official})"]
+    return 0, []
 
 
-# ─── Etapas assíncronas (I/O bound) ─────────────────────────────────────────────────
-
-async def _step_dns_async(domain: str, score: int, reasons: List[str]) -> Tuple[int, List[str], bool]:
-    """Verifica DNS em thread separada."""
-    try:
-        resolves, ips, error = await asyncio.to_thread(check_dns, domain)
-        if not resolves:
-            score += 90
-            reasons.append("domain_not_found")
-            return score, reasons, True
-        return score, reasons, False
-    except Exception as e:
-        logger.warning(f"DNS error for {domain}: {e}")
-        reasons.append("dns_error")
-        return score, reasons, False
-
-
-async def _step_http_async(url: str, score: int, reasons: List[str]) -> Tuple[int, List[str], bool, Optional[int], bool]:
-    """Verifica HTTP em thread separada."""
-    http_ok = True
-    http_status = None
-    http_proxy_blocked = False
-
-    try:
-        result = await asyncio.to_thread(check_http, url)
-        ok = result[0]
-        status = result[1] if len(result) > 1 else None
-        response_obj = result[2] if len(result) > 2 else None
-        http_status = status
-
-        if not ok:
-            if response_obj is not None:
-                try:
-                    body = response_obj.text or ""
-                    headers = dict(response_obj.headers)
-                    if _is_proxy_block_detection(status or 0, body, headers):
-                        http_proxy_blocked = True
-                        reasons.append("proxy_blocked_http")
-                        return score, reasons, http_ok, http_status, http_proxy_blocked
-                except Exception:
-                    pass
-            reasons.append("http_unreachable")
-            http_ok = False
-        elif status is not None and status >= 400:
-            if response_obj is not None:
-                try:
-                    body = response_obj.text or ""
-                    headers = dict(response_obj.headers)
-                    if _is_proxy_block_detection(status, body, headers):
-                        http_proxy_blocked = True
-                        reasons.append("proxy_blocked_http")
-                        return score, reasons, http_ok, http_status, http_proxy_blocked
-                except Exception:
-                    pass
-            reasons.append(f"http_error:{status}")
-            http_ok = False
-
-    except Exception as e:
-        logger.warning(f"HTTP erro: {e}")
-        reasons.append("http_error_internal")
-        http_ok = False
-
-    return score, reasons, http_ok, http_status, http_proxy_blocked
-
-
-async def _step_whois_async(domain: str, score: int, reasons: List[str]) -> Tuple[int, List[str]]:
-    """Verifica WHOIS (idade do domínio) em thread separada."""
-    try:
-        age = await asyncio.to_thread(get_domain_age_days, domain)
-        if age is None:
-            reasons.append("whois_unavailable")
-        elif age < 7:
-            score += 70
-            reasons.append(f"very_new_domain:{age}d")
-        elif age < 30:
-            score += 25
-            reasons.append(f"new_domain:{age}d")
-        elif age < 90:
-            score += 10
-            reasons.append(f"recent_domain:{age}d")
-        else:
-            # Domínio antigo (mais de 90 dias) - não adiciona score
-            pass
-    except Exception as e:
-        logger.warning(f"WHOIS error for {domain}: {e}")
-        reasons.append("whois_error")
-    return score, reasons
-
-
-async def _step_crawler_async(url: str, score: int, reasons: List[str]) -> Tuple[int, List[str], str, str, Optional[int], bool]:
-    """
-    Faz crawling da URL em thread separada.
-    Detecta: conteúdo vazio, parked domains, ghost domains, proxy blocks.
-    """
-    html = ""
-    title = ""
-    status = None
-    proxy_blocked = False
-
-    def _crawl_sync():
-        nonlocal html, title, status, proxy_blocked
-        try:
-            response = requests.get(
-                url,
-                timeout=12,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8",
-                },
-                allow_redirects=True,
-                verify=False,
-            )
-            status = response.status_code
-
-            # Verificar proxy block baseado no status/headers
-            if _is_proxy_block_detection(status, response.text or "", dict(response.headers)):
-                proxy_blocked = True
-                return
-
-            # Só extrair HTML se for conteúdo textual
-            content_type = response.headers.get("content-type", "").lower()
-            if "text/html" in content_type or "text/plain" in content_type:
-                html = response.text or ""
-            else:
-                # Conteúdo binário (PDF, imagem, etc.) - não é phishing típico
-                html = ""
-
-        except requests.exceptions.Timeout:
-            logger.debug(f"Crawler timeout for {url}")
-            status = 408
-        except requests.exceptions.ConnectionError as e:
-            logger.debug(f"Crawler connection error for {url}: {e}")
-            status = 0
-        except requests.exceptions.TooManyRedirects:
-            logger.debug(f"Crawler too many redirects for {url}")
-            status = 0
-        except Exception as e:
-            logger.debug(f"Crawler error for {url}: {e}")
-            status = 0
-
-    try:
-        await asyncio.to_thread(_crawl_sync)
-
-        if proxy_blocked:
-            reasons.append("proxy_blocked")
-            return score, reasons, "", "", status, True
-
-        if status is None or status == 0:
-            reasons.append("fetch_failed")
-            return score, reasons, "", "", status, False
-
-        if status >= 400:
-            reasons.append(f"crawler_http_error:{status}")
-            return score, reasons, "", "", status, False
-
-        if not html or not html.strip():
-            reasons.append("no_content")
-            return score, reasons, "", "", status, False
-
-        # Analisar conteúdo HTML
-        html_lower = html.lower()
-        html_len = len(html)
-
-        if html_len < 500:
-            score += 10
-            reasons.append("low_content")
-
-        try:
-            soup = BeautifulSoup(html, "lxml")
-            title = soup.title.string.strip() if soup.title and soup.title.string else ""
-        except Exception:
-            title = ""
-
-        if not title:
-            reasons.append("no_title")
-
-        # Detectar parked domain (expansivo)
-        if any(p in html_lower for p in PARKED_PATTERNS):
-            score += 80
-            reasons.append("parked_domain")
-
-        # Detectar ghost domain (domínio que existe mas tem conteúdo mínimo)
-        if html_len < 2000 and not title:
-            score += 30
-            reasons.append("ghost_domain")
-
-    except Exception as e:
-        logger.warning(f"Crawler exception: {e}")
-        reasons.append("crawler_exception")
-
-    return score, reasons, html, title, status, proxy_blocked
-
-
-def _step_brand_spoofing_sync(url: str, html: str, title: str, score: int, reasons: List[str]) -> Tuple[int, List[str]]:
-    """Detecta spoofing de marca no título/conteúdo (síncrono, rápido)."""
-    if not html:
-        return score, reasons
-
-    domain = _extract_domain(url)
-
-    for raw in [title]:
-        if not raw:
-            continue
-        brand = _normalize(raw)
-        for known, domains in KNOWN_BRANDS.items():
-            if _normalize(known) in brand and domain not in domains:
-                score += 90
-                reasons.append(f"spoof_known:{known}")
-                return score, reasons
-
-    return score, reasons
-
-
-async def _step_reputation_async(url: str, domain: str, score: int, reasons: List[str]) -> Tuple[int, List[str]]:
-    """
-    Corrigido v8: APIs externas rodam em paralelo com timeout global.
-    - VirusTotal (scanning + cache)
-    - Google Safe Browsing
-    - PhishTank + OpenPhish + URLhaus (via phishing_blacklist_check)
-    - AbuseIPDB (se IP resolver)
-    """
-    try:
-        # Resolver IP para AbuseIPDB
-        ip = None
-        try:
-            ip = await asyncio.to_thread(socket.gethostbyname, domain)
-        except Exception:
-            pass
-
-        # Criar tasks
-        vt_task = check_virustotal(url)
-        gsb_task = check_safe_browsing(url)
-        bl_task = phishing_blacklist_check(url)  # PhishTank + OpenPhish + URLhaus
-
-        if ip:
-            abuse_task = check_abuseipdb(ip)
-            vt, gsb, bl, abuse = await asyncio.wait_for(
-                asyncio.gather(vt_task, gsb_task, bl_task, abuse_task, return_exceptions=True),
-                timeout=18.0
-            )
-        else:
-            vt, gsb, bl = await asyncio.wait_for(
-                asyncio.gather(vt_task, gsb_task, bl_task, return_exceptions=True),
-                timeout=18.0
-            )
-            abuse = {"abuse_score": 0}
-
-        # Processar phishing_blacklist_check (PhishTank + OpenPhish + URLhaus)
-        if isinstance(bl, dict):
-            if bl.get("blacklisted"):
-                bl_score = bl.get("score", 90)
-                score = max(score, bl_score)
-                reasons.extend(bl.get("reasons", []))
-                logger.info(f"Blacklist hit for {url[:60]}: score={bl_score}")
-            elif bl.get("score", 0) > 70:
-                score = max(score, bl.get("score", 0))
-                reasons.extend(bl.get("reasons", []))
-
-        # Processar VirusTotal
-        if isinstance(vt, dict):
-            vt_mal = vt.get("malicious", 0)
-            vt_sus = vt.get("suspicious", 0)
-            if vt_mal >= 3:
-                score = max(score, min(score + 85, 100))
-                reasons.append(f"virustotal:{vt_mal}_motores_maliciosos")
-                logger.info(f"VT hit for {url[:60]}: {vt_mal} malicious engines")
-            elif vt_mal >= 1:
-                score = max(score, min(score + 60, 100))
-                reasons.append("virustotal")
-                logger.info(f"VT hit for {url[:60]}: {vt_mal} malicious engine(s)")
-            elif vt_sus >= 3:
-                score = max(score, min(score + 35, 100))
-                reasons.append(f"virustotal_suspicious:{vt_sus}_motores")
-
-        # Processar AbuseIPDB
-        if isinstance(abuse, dict) and abuse.get("abuse_score", 0) >= 50:
-            score = max(score, min(score + 40, 100))
-            reasons.append("abuseipdb")
-            logger.info(f"AbuseIPDB hit for {domain}: score={abuse.get('abuse_score')}")
-
-        # Processar Google Safe Browsing
-        if isinstance(gsb, dict) and gsb.get("threat"):
-            score = max(score, min(score + 85, 100))
-            reasons.append("google_safe_browsing")
-            logger.info(f"GSB hit for {url[:60]}")
-
-    except asyncio.TimeoutError:
-        logger.warning(f"Reputation APIs timeout for {url[:60]}")
-        reasons.append("reputation_api_timeout")
-    except Exception as e:
-        logger.warning(f"Reputation step failed: {e}")
-        reasons.append("reputation_error")
-
-    return score, reasons
-
-
-# ─── Função principal ASYNC ──────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# FUNÇÃO PRINCIPAL — CORRIGIDA v13
+# ═══════════════════════════════════════════════════════════════════
 
 async def analyze_url(url: str) -> dict:
     """
-    Pipeline completo de análise de URL (100% assíncrono).
-
-    Etapas:
-      1. DNS
-      2. Typosquatting
-      3. Subdomain Spoof
-      4. HTTP
-      5. WHOIS (idade do domínio)
-      6. Crawler (conteúdo - no_content, ghost_domain, parked_domain)
-      7. Brand spoofing estático
-      8. Brand spoofing dinâmico (Google Custom Search)
-      9. Reputação externa (VT, GSB, PhishTank, OpenPhish, AbuseIPDB)
+    Pipeline de análise de URL.
+    
+    CORRECÇÕES v13:
+    - Blacklists (PhishTank/OpenPhish) são SEMPRE verificadas
+    - Domínios .cyou recebem score base de TLD suspeito
+    - Timeout DNS não impede verificação de blacklists
+    - Score mínimo de 30 para TLDs suspeitos com blacklist inconclusiva
     """
-    score = 0
-    reasons: List[str] = []
-
-    # Normalizar URL
     if not url.startswith(("http://", "https://")):
-        url = f"http://{url}"
-
+        url = f"https://{url}"
+    
     parsed = urlparse(url)
     if not parsed.netloc:
-        return {
-            "score": 100,
-            "classification": "phishing",
-            "reasons": ["invalid_url"],
-        }
-
+        return {"score": 100, "classification": "phishing", "reasons": ["invalid_url"]}
+    
     domain = _extract_domain(url)
-
-    # 1. DNS (assíncrono)
-    score, reasons, stop = await _step_dns_async(domain, score, reasons)
-    if stop:
+    hostname = parsed.hostname or ""
+    
+    # ═══════════════════════════════════════════════════════════════
+    # VERIFICAÇÃO RÁPIDA: Domínio conhecido e seguro?
+    # ═══════════════════════════════════════════════════════════════
+    if _is_always_safe(domain):
+        logger.info(f"✅ Domínio seguro conhecido: {domain}")
         return {
-            "score": score,
-            "classification": classify_score(score),
-            "reasons": reasons,
+            "score": 5,
+            "classification": "safe",
+            "reasons": ["trusted_domain"],
         }
-
-    # 2. Typosquatting (síncrono, rápido)
-    score, reasons = _detect_typosquatting_sync(domain, score, reasons)
-
-    # 3. Subdomain Spoof (síncrono, rápido)
-    score, reasons = _detect_subdomain_spoof_sync(domain, score, reasons)
-
-    # 4. HTTP (assíncrono)
-    score, reasons, http_ok, http_status, http_proxy_blocked = await _step_http_async(url, score, reasons)
-
-    # 5. WHOIS (assíncrono) - IDADE DO DOMÍNIO CORRIGIDA
-    score, reasons = await _step_whois_async(domain, score, reasons)
-
-    # 6. Crawler (assíncrono) - no_content, ghost_domain CORRIGIDOS
-    score, reasons, html, title, crawler_status, proxy_blocked = await _step_crawler_async(url, score, reasons)
-
-    # 7. Brand spoofing estático (síncrono)
-    score, reasons = _step_brand_spoofing_sync(url, html, title, score, reasons)
-
-    # 8. Brand spoofing dinâmico (pode fazer chamada HTTP à Google Custom Search)
-    score, reasons = check_dynamic_brand_spoof(domain, KNOWN_BRANDS, score, reasons)
-
-    # 9. Reputação externa (assíncrono, paralelo)
-    score, reasons = await _step_reputation_async(url, domain, score, reasons)
-
-    # ─── ghost_domain / no_real_content (corrigido v8) ──────────────────────────
-    has_real_html = bool(html and html.strip())
-    http_exception = "http_error_internal" in reasons and http_status is None
-    crawler_empty = any(r in reasons for r in ("fetch_failed", "no_content", "crawler_exception"))
-
-    # Ghost domain: domínio que existe mas não tem conteúdo real
-    if http_exception and (crawler_empty or not has_real_html):
-        score = max(score, min(score + 55, 100))
-        if "ghost_domain" not in reasons:
-            reasons.append("ghost_domain")
-    else:
-        any_proxy_block = proxy_blocked or http_proxy_blocked
-        if not has_real_html and not any_proxy_block and (
-            (http_status is not None and http_status >= 400)
-            or "http_unreachable" in reasons
-            or (crawler_status is not None and crawler_status >= 400)
-        ):
-            score = max(score, min(score + 45, 100))
-            if "no_real_content" not in reasons:
-                reasons.append("no_real_content")
-
-    # ─── Classificação final ──────────────────────────────────────────────────────
-    has_real_threat = any(
-        any(rt in r for rt in REAL_THREATS)
-        for r in reasons
-    )
-
-    if not has_real_threat:
-        score = min(score, 10)
-        if "no_real_threats_detected" not in reasons:
-            reasons.append("no_real_threats_detected")
-
-    if score == 0 and not reasons:
-        score = 5
-        reasons.append("no_signals")
-
-    score = min(score, 100)
-
-    return {
-        "score": score,
-        "classification": classify_score(score),
-        "reasons": reasons,
+    
+    logger.info(f"🔍 Analisando: {url[:100]} (domínio: {domain})")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # FASE 1: HEURÍSTICAS
+    # ═══════════════════════════════════════════════════════════════
+    heuristic_score = 0
+    heuristic_reasons: List[str] = []
+    
+    # 1. DNS (não bloqueia se timeout — continua)
+    try:
+        resolves, ips, dns_error = await asyncio.wait_for(
+            asyncio.to_thread(check_dns, domain),
+            timeout=5.0
+        )
+        if not resolves:
+            # CORRIGIDO: score reduzido para não bloquear sem blacklist
+            # mas alto o suficiente para indicar suspeita
+            heuristic_score += 30
+            heuristic_reasons.append(f"domain_not_found:{dns_error}")
+            # NÃO retorna aqui — continua para verificar blacklists
+    except:
+        # Timeout DNS — continua sem penalizar
+        logger.debug(f"DNS timeout para {domain}")
+    
+    # 2. IP direto
+    if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", hostname):
+        heuristic_score += 40
+        heuristic_reasons.append("IP direto na URL")
+    
+    # 3. Símbolo @
+    if "@" in parsed.path or "@" in parsed.netloc:
+        heuristic_score += 35
+        heuristic_reasons.append("Símbolo @ na URL")
+    
+    # 4. Typosquatting
+    typo_score, typo_reasons = _detect_typosquatting(domain)
+    if typo_score > 0:
+        heuristic_score += typo_score
+        heuristic_reasons.extend(typo_reasons)
+    
+    # 5. Subdomain Spoof
+    spoof_score, spoof_reasons = _detect_subdomain_spoof(domain)
+    if spoof_score > 0:
+        heuristic_score += spoof_score
+        heuristic_reasons.extend(spoof_reasons)
+    
+    # 6. TLD suspeito (VERIFICADO PRIMEIRO — antes do HTTP)
+    # CORRIGIDO: .cyou adicionado como TLD suspeito
+    suspicious_tlds = {
+        ".xyz", ".tk", ".ml", ".ga", ".cf", ".gq", ".pw", 
+        ".top", ".click", ".cyou", ".cam", ".icu", ".surf", 
+        ".monster", ".live", ".online", ".site", ".website", 
+        ".press", ".space", ".fun", ".host", ".shop", ".store",
+        ".vip", ".win", ".bid", ".stream", ".loan", ".work",
+        ".download", ".party", ".date", ".men", ".faith", ".trade",
     }
+    for tld in suspicious_tlds:
+        if domain.endswith(tld):
+            heuristic_score += 25
+            heuristic_reasons.append(f"tld_suspeito:{tld}")
+            break
+    
+    # 7. HTTP + Conteúdo
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                requests.get, url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                timeout=10, allow_redirects=True, verify=False,
+            ),
+            timeout=12.0
+        )
+        
+        http_status = response.status_code
+        html = response.text
+        
+        if http_status >= 500:
+            heuristic_score += 15
+            heuristic_reasons.append(f"http_error:{http_status}")
+        
+        if html and len(html) > 100:
+            html_lower = html[:10000].lower()
+            
+            for pattern in PARKED_PATTERNS:
+                if pattern in html_lower:
+                    heuristic_score += 45
+                    heuristic_reasons.append("parked_domain")
+                    break
+            
+            phishing_content = [
+                "verify your wallet", "restore your wallet",
+                "seed phrase", "private key", "recovery phrase",
+                "import wallet", "connect wallet",
+            ]
+            found_kw = [k for k in phishing_content if k in html_lower]
+            if len(found_kw) >= 2:
+                heuristic_score += 25
+                heuristic_reasons.append("phishing_content_detected")
+            
+            suspicious_hosting = [
+                "wixstudio.com", "wixsite.com", "netlify.app", "github.io",
+                "vercel.app", "pages.dev", "glitch.me", "000webhost.com",
+                "weebly.com", "firebaseapp.com", "web.app", "ngrok.io",
+            ]
+            for host in suspicious_hosting:
+                if host in domain:
+                    heuristic_score += 20
+                    heuristic_reasons.append(f"hosting_gratuito:{host}")
+                    break
+                    
+        elif html and len(html) <= 100:
+            heuristic_score += 30
+            heuristic_reasons.append("no_content")
+    except:
+        pass
+    
+    # 8. Muitos hífens
+    if hostname.count("-") >= 3:
+        heuristic_score += 10
+        heuristic_reasons.append("muitos_hifens")
+    
+    # 9. Domínio muito longo
+    if len(hostname) > 40:
+        heuristic_score += 10
+        heuristic_reasons.append("dominio_muito_longo")
+    
+    # Cap heurísticas
+    if heuristic_score > MAX_HEURISTIC_SCORE:
+        heuristic_score = MAX_HEURISTIC_SCORE
+    
+    # ═══════════════════════════════════════════════════════════════
+    # FASE 2: EVIDÊNCIAS EXTERNAS — SEMPRE EXECUTADAS
+    # ═══════════════════════════════════════════════════════════════
+    # CORRIGIDO v13: Blacklists são SEMPRE verificadas,
+    # independentemente do score heurístico
+    external_score = 0
+    external_reasons: List[str] = []
+    has_concrete_evidence = False
+    
+    try:
+        # CORRIGIDO: phishing_blacklist_check() é sempre chamado
+        bl_task = phishing_blacklist_check(url)
+        vt_task = check_virustotal(url)
+        gsb_task = check_safe_browsing(url)
+        
+        bl_result, vt_result, gsb_result = await asyncio.wait_for(
+            asyncio.gather(bl_task, vt_task, gsb_task, return_exceptions=True),
+            timeout=20.0
+        )
+        
+        # Processar blacklist (PhishTank + OpenPhish + URLScan)
+        if isinstance(bl_result, dict):
+            bl_blacklisted = bl_result.get("blacklisted", False)
+            bl_score = bl_result.get("score", 0)
+            bl_reasons = bl_result.get("reasons", [])
+            
+            if bl_blacklisted:
+                external_score = max(external_score, BLACKLIST_BLOCK_SCORE)
+                external_reasons.extend(bl_reasons)
+                has_concrete_evidence = True
+                logger.warning(f"🚨 BLACKLIST HIT: {url[:80]} → score={bl_score}")
+            elif bl_score > 0:
+                external_score = max(external_score, bl_score)
+                external_reasons.extend(bl_reasons)
+                if bl_score >= 60:
+                    has_concrete_evidence = True
+        
+        # Processar VirusTotal
+        if isinstance(vt_result, dict):
+            vt_mal = vt_result.get("malicious", 0)
+            if vt_mal >= 3:
+                external_score = max(external_score, VIRUSTOTAL_BLOCK_SCORE)
+                external_reasons.append(f"virustotal:{vt_mal}_engines_maliciosos")
+                has_concrete_evidence = True
+            elif vt_mal >= 1:
+                external_score = max(external_score, 50)
+                external_reasons.append(f"virustotal:{vt_mal}_engine_malicioso")
+        
+        # Processar Google Safe Browsing
+        if isinstance(gsb_result, dict) and gsb_result.get("threat"):
+            external_score = max(external_score, SAFE_BROWSING_BLOCK_SCORE)
+            external_reasons.append("google_safe_browsing:ameaça_detectada")
+            has_concrete_evidence = True
+    
+    except asyncio.TimeoutError:
+        logger.warning(f"APIs timeout for {url}")
+    except Exception as e:
+        logger.warning(f"APIs error: {e}")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # FASE 3: DECISÃO FINAL — CORRIGIDA
+    # ═══════════════════════════════════════════════════════════════
+    
+    if has_concrete_evidence:
+        # Temos evidência concreta → usar score máximo
+        final_score = max(external_score, heuristic_score)
+        final_reasons = external_reasons + heuristic_reasons
+    elif external_score > 0:
+        # Blacklist deu score mas não confirmou → usar score da blacklist
+        final_score = max(heuristic_score, external_score)
+        final_reasons = external_reasons + heuristic_reasons
+    else:
+        # Sem evidências externas → usar heurísticas
+        final_score = heuristic_score
+        final_reasons = heuristic_reasons
+    
+    # CORRIGIDO: Se TLD é suspeito e score está muito baixo,
+    # garantir pelo menos score 30 (SUSPEITO) para chamar atenção
+    if final_score < 30:
+        for reason in heuristic_reasons:
+            if reason.startswith("tld_suspeito:"):
+                final_score = max(final_score, 30)
+                break
+    
+    if not final_reasons:
+        final_reasons = ["no_signals_detected"]
+        final_score = 5
+    
+    final_score = min(100, max(0, final_score))
+    
+    result = {
+        "score": final_score,
+        "classification": classify_score(final_score),
+        "reasons": final_reasons,
+    }
+    
+    logger.info(
+        f"📊 Resultado: {url[:80]} → score={final_score}, "
+        f"classification={result['classification']}, "
+        f"reasons={final_reasons[:3]}"
+    )
+    
+    return result

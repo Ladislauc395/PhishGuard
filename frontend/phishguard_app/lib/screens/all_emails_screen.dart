@@ -316,6 +316,54 @@ class _AllEmailsScreenState extends State<AllEmailsScreen>
     }
   }
 
+  /// Bloquear manualmente um email (mover para lixo + label PHISHGUARD_BLOCKED)
+  Future<void> _blockEmail(AnalysedEmail email) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text('Bloquear email?'),
+        content: Text(
+          'Vai marcar o email de "${email.sender}" como phishing e movê-lo para o lixo.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancelar'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppColors.danger,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('Bloquear'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      await _svc.blockEmail(
+        email.id,
+        reasons: ['Bloqueado manualmente pelo utilizador'],
+        score: 100,
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Email bloqueado com sucesso'),
+        backgroundColor: AppColors.danger,
+      ));
+      await _load();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('Erro ao bloquear: $e'),
+        backgroundColor: AppColors.danger,
+      ));
+    }
+  }
+
   void _showDetail(AnalysedEmail email) {
     showModalBottomSheet(
       context: context,
@@ -328,6 +376,12 @@ class _AllEmailsScreenState extends State<AllEmailsScreen>
             ? () {
                 Navigator.pop(context);
                 _unblock(email);
+              }
+            : null,
+        onBlock: email.verdict != EmailVerdict.blocked
+            ? () {
+                Navigator.pop(context);
+                _blockEmail(email);
               }
             : null,
       ),
@@ -821,8 +875,9 @@ class _EmailTile extends StatelessWidget {
 class _DetailSheet extends StatelessWidget {
   final AnalysedEmail email;
   final VoidCallback? onUnblock;
+  final VoidCallback? onBlock;
 
-  const _DetailSheet({required this.email, this.onUnblock});
+  const _DetailSheet({required this.email, this.onUnblock, this.onBlock});
 
   @override
   Widget build(BuildContext context) {
@@ -942,6 +997,25 @@ class _DetailSheet extends StatelessWidget {
                   foregroundColor: AppColors.success,
                   side: const BorderSide(color: AppColors.success),
                   padding: const EdgeInsets.symmetric(vertical: 12),
+                ),
+              ),
+            ),
+          ],
+          if (onBlock != null) ...[
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                onPressed: onBlock,
+                icon: const Icon(Icons.block_rounded, size: 18),
+                label: const Text('Bloquear como Phishing'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppColors.danger,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10),
+                  ),
                 ),
               ),
             ),

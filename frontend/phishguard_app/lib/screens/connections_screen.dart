@@ -14,6 +14,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../services/integrations_service.dart';
 import '../services/extension_service.dart';
+import 'all_emails_screen.dart';
 
 // ─── Paleta de cores clara (White / Blue) ────────────────────────
 
@@ -100,34 +101,36 @@ class _ConnectionsScreenState extends State<ConnectionsScreen>
 
   // ── Gmail actions ────────────────────────────────────────────────
 
-  /// CORRIGIDO v12: usa inAppWebView para não abandonar o app.
-  /// O browser OAuth interno faz redirect para o servidor que guarda o token
-  /// e fecha o WebView automaticamente.
+  /// CORRIGIDO v13: NÃO abre nenhum browser nem WebView.
+  /// Como o GMAIL_REFRESH_TOKEN já está no .env, o Gmail já está conectado.
+  /// Este botão apenas verifica o estado e navega para AllEmailsScreen.
   Future<void> _connectGmail() async {
     setState(() {
       _loadingGmail = true;
       _gmailError = null;
     });
     try {
-      final url = await _integrations.getGmailAuthUrl();
-      final uri = Uri.parse(url);
-
-      // Preferir WebView interno; fallback para browser externo se falhar
-      bool launched = false;
-      try {
-        launched = await launchUrl(uri, mode: LaunchMode.inAppWebView);
-      } catch (_) {
-        launched = false;
-      }
-
-      if (!launched) {
-        // Fallback — browser externo (iOS Safari / Chrome Android)
-        await launchUrl(uri, mode: LaunchMode.externalApplication);
-      }
-
-      // Aguardar callback e verificar estado
-      await Future.delayed(const Duration(seconds: 4));
+      // Verificar se já está conectado via refresh_token no .env
       await _loadStatus();
+
+      if (_status.gmailConnected) {
+        // Já conectado: navegar directamente para os emails
+        _showSnack('✅ Gmail conectado! A abrir emails...');
+        await Future.delayed(const Duration(milliseconds: 600));
+        if (mounted) {
+          Navigator.push(
+            context,
+            MaterialPageRoute(builder: (_) => const AllEmailsScreen()),
+          );
+        }
+      } else {
+        // Não conectado: mostrar instruções inline (sem abrir browser)
+        setState(() {
+          _gmailError =
+              'Gmail não conectado. Certifica-te que GMAIL_REFRESH_TOKEN '
+              'está configurado no ficheiro .env do servidor e reinicia o backend.';
+        });
+      }
     } catch (e) {
       if (mounted) setState(() => _gmailError = e.toString());
     } finally {
@@ -320,12 +323,30 @@ class _ConnectionsScreenState extends State<ConnectionsScreen>
         if (_gmailError != null) _buildErrorBanner(_gmailError!),
         const SizedBox(height: 12),
         if (!connected)
-          _buildActionButton(
-            label: 'Ligar Gmail',
-            icon: Icons.link_rounded,
-            color: _kBlue,
-            loading: _loadingGmail,
-            onPressed: _connectGmail,
+          Column(
+            children: [
+              _buildActionButton(
+                label: 'Verificar Ligação Gmail',
+                icon: Icons.check_circle_outline_rounded,
+                color: _kBlue,
+                loading: _loadingGmail,
+                onPressed: _connectGmail,
+              ),
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: _kBlue.withOpacity(0.05),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: _kBlue.withOpacity(0.2)),
+                ),
+                child: const Text(
+                  'ℹ️ O Gmail liga automaticamente via token configurado no servidor. '
+                  'Não é necessário abrir nenhum browser.',
+                  style: TextStyle(color: _kTextMuted, fontSize: 12, height: 1.4),
+                ),
+              ),
+            ],
           )
         else ...[
           if (_status.lastScanAt != null)
@@ -336,6 +357,18 @@ class _ConnectionsScreenState extends State<ConnectionsScreen>
               '${_status.lastScanThreats}',
               valueColor: Colors.orange[700],
             ),
+          const SizedBox(height: 8),
+          // Botão principal: ver emails (navega para AllEmailsScreen)
+          _buildActionButton(
+            label: '📬 Ver Emails Analisados',
+            icon: Icons.inbox_rounded,
+            color: _kBlue,
+            loading: _loadingGmail,
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const AllEmailsScreen()),
+            ),
+          ),
           const SizedBox(height: 8),
           Row(
             children: [

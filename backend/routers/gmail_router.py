@@ -3,12 +3,9 @@ backend/routers/gmail_router.py
 ────────────────────────────────
 Endpoints FastAPI para o Gmail PhishGuard.
 
-CORRECÇÕES v8:
-  - GET /gmail/emails/all: campo "scanning" mantém-se mas o backend
-    nunca bloqueia — devolve cache imediatamente em qualquer cenário.
-  - POST /gmail/scan/refresh: novo endpoint para forçar scan completo
-    (chamado pelo botão "Actualizar" do Flutter).
-  - Timeout do endpoint principal: 30 s (resposta é imediata, não necessita mais).
+CORRECÇÕES v9:
+  - GET /auth/gmail/status: inclui diagnóstico detalhado
+  - GET /gmail/emails/all: resposta sempre imediata
 """
 
 from __future__ import annotations
@@ -24,6 +21,7 @@ from backend.services.gmail_hook import (
     get_all_analysed_emails,
     get_blocked_emails_async,
     get_gmail_auth_url,
+    get_gmail_diagnostics,
     is_gmail_connected,
     is_scan_running,
     scan_inbox,
@@ -89,11 +87,14 @@ async def gmail_callback(
 
 @router.get("/auth/gmail/status")
 async def gmail_status() -> Dict[str, Any]:
+    """Estado do Gmail com diagnóstico detalhado."""
     connected = is_gmail_connected()
+    diag = get_gmail_diagnostics()
     return {
         "gmail_connected":       connected,
         "gmail_monitor_running": False,
         "last_scan_at":          None,
+        "diagnostics":           diag,
     }
 
 
@@ -102,20 +103,8 @@ async def gmail_status() -> Dict[str, Any]:
 @router.get("/gmail/emails/all")
 async def get_all_emails(max_results: int = Query(100, ge=1, le=200)) -> Dict:
     """
-    Devolve TODOS os emails analisados nesta sessão, ordenados por data
-    de recepção (mais recente primeiro).
-
-    CORRIGIDO v8:
-    - Resposta SEMPRE imediata (nunca bloqueia).
-    - Se scanning=true, o Flutter faz polling a cada 3 s.
-    - Cache auto-actualizado em background quando expira (> 5 min).
-
-    Resposta:
-    {
-      "emails":   [...],   ← ordenados por data DESC
-      "total":    N,
-      "scanning": true/false
-    }
+    Devolve TODOS os emails analisados nesta sessão.
+    Resposta SEMPRE imediata.
     """
     if not is_gmail_connected():
         raise HTTPException(status_code=403, detail="Gmail não conectado")
@@ -170,13 +159,7 @@ async def trigger_scan(
 async def force_scan_refresh(
     max_results: int = Query(30, ge=1, le=100),
 ) -> Dict[str, Any]:
-    """
-    Força um scan completo e aguarda o resultado.
-
-    NOVO v8: Chamado pelo botão "Actualizar" do Flutter.
-    Aguarda o scan (pode demorar 30-60 s para 30 emails).
-    Devolve os resultados actualizados.
-    """
+    """Força um scan completo e aguarda o resultado."""
     if not is_gmail_connected():
         raise HTTPException(status_code=403, detail="Gmail não conectado")
     try:
