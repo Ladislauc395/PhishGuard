@@ -12,7 +12,7 @@ import 'dart:convert';
 import 'dart:async';
 import 'package:http/http.dart' as http;
 
-const String _baseUrl = 'http://10.26.54.68:8000';
+const String _baseUrl = 'http://10.249.221.68:8000';
 const Duration _timeout = Duration(seconds: 10);
 
 // ─── Modelos ──────────────────────────────────────────────────────

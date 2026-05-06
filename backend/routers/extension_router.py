@@ -45,7 +45,7 @@ try:
 except ImportError:
     _HAS_ML = False
 
-_BACKEND_PUBLIC_URL = "http://10.26.54.68:8000"
+_BACKEND_PUBLIC_URL = "http://10.249.221.68:8000"
 
 _rate_limit: dict[str, list[float]] = {}
 _RATE_WINDOW = 60.0

@@ -1,7 +1,7 @@
 /**
  * PhishGuard Angola — background.js (Service Worker MV3)
  */
-const DEFAULT_API_BASE     = "http://10.26.54.68:8000";
+const DEFAULT_API_BASE     = "http://10.249.221.68:8000";
 const CACHE_TTL_MS         = 10 * 60 * 1000;
 const DEFAULT_BLOCK_SCORE  = 60;
 const DEFAULT_WARN_SCORE   = 30;
@@ -94,7 +94,7 @@ chrome.webNavigation.onCommitted.addListener(async (details) => {
   try {
     const parsed = new URL(url);
     if (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1"
-        || parsed.hostname === "10.26.54.68" || parsed.hostname === "10.249.221.68") return;
+        || parsed.hostname === "10.249.221.68" || parsed.hostname === "10.249.221.68") return;
   } catch { return; }
 
   const lastCheck = tabLastCheck.get(tabId) || 0;

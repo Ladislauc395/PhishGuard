@@ -2,7 +2,7 @@
  * PhishGuard Angola — popup.js
  * CORRIGIDO: event listeners em vez de onclick inline
  */
-const DEFAULT_API_BASE = "http://10.26.54.68:8000";
+const DEFAULT_API_BASE = "http://10.249.221.68:8000";
 
 document.addEventListener("DOMContentLoaded", async () => {
   setupTabs();

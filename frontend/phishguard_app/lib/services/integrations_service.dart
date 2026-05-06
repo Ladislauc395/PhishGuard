@@ -10,7 +10,7 @@ import 'dart:async';
 import 'package:http/http.dart' as http;
 
 // ─── URL do backend ───────────────────────────────────────────────
-const String _baseUrl = 'http://10.26.54.68:8000';
+const String _baseUrl = 'http://10.249.221.68:8000';
 
 const Duration _scanTimeout = Duration(seconds: 120);
 const Duration _defaultTimeout = Duration(seconds: 30);
