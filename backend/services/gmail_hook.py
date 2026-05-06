@@ -1,14 +1,15 @@
 """
 backend/services/gmail_hook.py
 ───────────────────────────────
-Gmail API — CORRECÇÕES v14:
+Gmail API — CORRECÇÕES v16
 
-CORRECÇÕES v14:
-  1. DIAGNÓSTICO MELHORADO: Quando GMAIL_REFRESH_TOKEN está configurado,
-     mostra estado detalhado em vez de "Gmail não conectado".
-  2. _get_access_token_async() agora loga o estado do token.
-  3. Função is_gmail_connected() verifica token + consegue obter access_token.
-  4. Se token refresh falhar, mostra erro específico (expirado, inválido, etc.)
+CORRECÇÕES v16:
+- GMAIL_REDIRECT_URI usa localhost:8000 (obrigatório para Google OAuth)
+- _get_access_token_async() com melhor logging de erros
+- scan_inbox() define _scan_running=False SEMPRE (finally)
+- is_gmail_connected() verifica refresh_token existe
+- get_all_analysed_emails() inicia scan se cache vazia
+- Diagnóstico detalhado via get_gmail_diagnostics()
 """
 
 from __future__ import annotations
@@ -19,7 +20,6 @@ import json
 import logging
 import os
 import time
-from email.utils import parseaddr
 from typing import Dict, List, Optional
 
 import httpx
@@ -33,16 +33,9 @@ logger = logging.getLogger(__name__)
 GMAIL_CLIENT_ID     = settings.GMAIL_CLIENT_ID
 GMAIL_CLIENT_SECRET = settings.GMAIL_CLIENT_SECRET
 
-_configured_redirect = getattr(settings, "GMAIL_REDIRECT_URI", "")
-if not _configured_redirect or _configured_redirect == "http://localhost":
-    GMAIL_REDIRECT_URI = "http://10.249.221.68:8000/auth/gmail/callback"
-    logger.info(
-        "GMAIL_REDIRECT_URI a usar: %s "
-        "(certifique-se que este URI está registado na Google Cloud Console)",
-        GMAIL_REDIRECT_URI,
-    )
-else:
-    GMAIL_REDIRECT_URI = _configured_redirect
+# ⚠️ CRÍTICO: Google OAuth NÃO permite IPs privados (172.x, 192.x, 10.x)
+# como redirect_uri. Apenas localhost ou domínios públicos com HTTPS.
+GMAIL_REDIRECT_URI = "http://localhost:8000/auth/gmail/callback"
 
 GMAIL_TOKEN_URL  = "https://oauth2.googleapis.com/token"
 GMAIL_AUTH_URL   = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -71,7 +64,6 @@ _scan_running: bool = False
 
 _TOKENS_FILE = os.path.join(os.path.dirname(__file__), ".gmail_tokens.json")
 
-# Estado detalhado de diagnóstico
 _gmail_diag: dict = {
     "connected": False,
     "refresh_token_configured": False,
@@ -113,7 +105,7 @@ def _save_refresh_token(refresh_token: str) -> None:
     try:
         with open(_TOKENS_FILE, "w") as f:
             json.dump({"refresh_token": refresh_token, "saved_at": time.time()}, f)
-        logger.info("Gmail refresh_token guardado em %s", _TOKENS_FILE)
+        logger.info("✅ Gmail refresh_token guardado em %s", _TOKENS_FILE)
         _gmail_diag["refresh_token_configured"] = True
     except Exception as e:
         logger.warning("Não foi possível guardar refresh_token: %s", e)
@@ -127,18 +119,22 @@ def get_gmail_diagnostics() -> dict:
         **_gmail_diag,
         "last_check": _gmail_diag.get("last_check"),
         "refresh_token_configured": bool(settings.GMAIL_REFRESH_TOKEN),
+        "refresh_token_from_file": os.path.exists(_TOKENS_FILE),
         "client_id_configured": bool(settings.GMAIL_CLIENT_ID),
         "client_secret_configured": bool(GMAIL_CLIENT_SECRET),
+        "redirect_uri": GMAIL_REDIRECT_URI,
     }
 
 
 # ─── OAuth2 Flow ──────────────────────────────────────────────────
 
 def get_gmail_auth_url(state: str = "phishguard") -> str:
+    """Gera URL de autorização OAuth2 do Google."""
     if not GMAIL_CLIENT_ID:
         raise ValueError("GMAIL_CLIENT_ID não configurado.")
     if not GMAIL_CLIENT_SECRET:
         raise ValueError("GMAIL_CLIENT_SECRET não configurado.")
+    
     from urllib.parse import urlencode
     params = {
         "client_id":     GMAIL_CLIENT_ID,
@@ -155,6 +151,10 @@ def get_gmail_auth_url(state: str = "phishguard") -> str:
 
 
 async def exchange_code_for_tokens(code: str) -> Dict:
+    """
+    Troca o código de autorização por access_token e refresh_token.
+    O refresh_token é guardado automaticamente.
+    """
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
         r = await c.post(GMAIL_TOKEN_URL, data={
             "client_id":     GMAIL_CLIENT_ID,
@@ -175,6 +175,7 @@ async def exchange_code_for_tokens(code: str) -> Dict:
         _token_cache["expires_at"]   = time.time() + data.get("expires_in", 3600)
         _gmail_diag["connected"] = True
         _gmail_diag["access_token_valid"] = True
+        logger.info("✅ Gmail: tokens obtidos com sucesso")
 
     return {"access_token": access_token, "refresh_token": refresh_token}
 
@@ -182,30 +183,24 @@ async def exchange_code_for_tokens(code: str) -> Dict:
 def is_gmail_connected() -> bool:
     """
     Verifica se o Gmail está conectado.
-    
-    CORRIGIDO v14:
-    - Se refresh_token existe, tenta usá-lo
-    - Se conseguir obter access_token → conectado
-    - Se falhar → mostra erro específico
+    Retorna True se o refresh_token existe (no .env ou ficheiro local).
     """
     refresh_token = _load_refresh_token()
     
     if not refresh_token:
         _gmail_diag["connected"] = False
-        _gmail_diag["last_error"] = "GMAIL_REFRESH_TOKEN não configurado no .env"
-        logger.warning("Gmail: NÃO conectado — refresh_token em falta")
+        _gmail_diag["last_error"] = "GMAIL_REFRESH_TOKEN não configurado"
+        logger.warning("⚠️ Gmail: NÃO conectado — refresh_token em falta")
         return False
     
-    # Temos refresh_token, mas precisamos verificar se funciona
-    # A verificação real é feita em _get_access_token_async()
-    # Aqui apenas confirmamos que existe
     _gmail_diag["connected"] = True
     _gmail_diag["last_check"] = time.time()
-    logger.info("Gmail: refresh_token configurado — tentando usar")
+    logger.info("✅ Gmail: refresh_token configurado")
     return True
 
 
 def is_scan_running() -> bool:
+    """Retorna True se há um scan em curso."""
     return _scan_running
 
 
@@ -214,11 +209,7 @@ def is_scan_running() -> bool:
 async def _get_access_token_async() -> Optional[str]:
     """
     Obtém um access token válido para a Gmail API.
-    
-    CORRIGIDO v14:
-    - Logs detalhados para diagnóstico
-    - Se refresh_token falhar, mostra erro específico
-    - Atualiza _gmail_diag com estado real
+    Tenta renovar com o refresh_token se necessário.
     """
     # Verificar cache
     expires_at = _token_cache.get("expires_at", 0)
@@ -233,22 +224,22 @@ async def _get_access_token_async() -> Optional[str]:
         _gmail_diag["access_token_valid"] = False
         _gmail_diag["last_error"] = "GMAIL_REFRESH_TOKEN não configurado"
         _gmail_diag["last_check"] = time.time()
-        logger.error("Gmail: refresh_token não disponível. Gmail não conectado.")
+        logger.error("❌ Gmail: refresh_token não disponível.")
         return None
     
     if not GMAIL_CLIENT_ID or not GMAIL_CLIENT_SECRET:
         _gmail_diag["last_error"] = "GMAIL_CLIENT_ID ou GMAIL_CLIENT_SECRET não configurados"
         _gmail_diag["last_check"] = time.time()
-        logger.error("Gmail: GMAIL_CLIENT_ID ou GMAIL_CLIENT_SECRET não configurados.")
+        logger.error("❌ Gmail: Client ID ou Client Secret em falta.")
         return None
 
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
             r = await c.post(GMAIL_TOKEN_URL, data={
-                "client_id": GMAIL_CLIENT_ID,
+                "client_id":     GMAIL_CLIENT_ID,
                 "client_secret": GMAIL_CLIENT_SECRET,
                 "refresh_token": refresh_token,
-                "grant_type": "refresh_token",
+                "grant_type":    "refresh_token",
             })
 
             if r.status_code != 200:
@@ -265,20 +256,17 @@ async def _get_access_token_async() -> Optional[str]:
                 _gmail_diag["last_check"] = time.time()
                 
                 logger.error(
-                    "Gmail token refresh falhou: %d %s — %s",
+                    "❌ Gmail token refresh falhou: %d %s — %s",
                     r.status_code, error_code, error_desc,
                 )
                 
                 if error_code == "invalid_grant":
                     logger.error(
-                        "🔴 GMAIL_REFRESH_TOKEN INVÁLIDO OU EXPIRADO. "
-                        "Necessário novo fluxo OAuth. "
-                        "Aceder a: http://10.249.221.68:8000/auth/gmail/url"
-                    )
-                elif error_code == "unauthorized_client":
-                    logger.error(
-                        "🔴 GMAIL_REFRESH_TOKEN não autorizado. "
-                        "Verifique se o Client ID corresponde ao projeto."
+                        "🔴 GMAIL_REFRESH_TOKEN INVÁLIDO OU EXPIRADO!\n"
+                        "   Para corrigir:\n"
+                        "   1. Acede a: http://localhost:8000/integrations/auth/gmail/url\n"
+                        "   2. Autoriza a aplicação\n"
+                        "   3. O novo token será guardado automaticamente"
                     )
                 
                 return None
@@ -313,6 +301,7 @@ async def _get_access_token_async() -> Optional[str]:
 
 
 def _auth_headers(token: str) -> Dict[str, str]:
+    """Headers de autorização para a Gmail API."""
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -323,6 +312,7 @@ async def _list_message_ids(
     max_results: int = 30,
     query: str = "",
 ) -> List[str]:
+    """Lista IDs das mensagens na inbox."""
     q = query or "newer_than:7d"
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
@@ -337,14 +327,15 @@ async def _list_message_ids(
             )
             r.raise_for_status()
             messages = r.json().get("messages", [])
-            logger.info("Gmail: %d emails encontrados na inbox", len(messages))
+            logger.info("✅ Gmail: %d emails encontrados na inbox", len(messages))
             return [m["id"] for m in messages]
     except Exception as exc:
-        logger.error("_list_message_ids falhou: %s", exc)
+        logger.error("❌ _list_message_ids falhou: %s", exc)
         return []
 
 
 async def _get_message_async(token: str, msg_id: str) -> Optional[Dict]:
+    """Obtém detalhes de uma mensagem específica."""
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
             r = await c.get(
@@ -428,6 +419,7 @@ _blocked_label_id_cache: Optional[str] = None
 
 
 async def _get_or_create_blocked_label(token: str) -> Optional[str]:
+    """Obtém ou cria a label PHISHGUARD_BLOCKED."""
     global _blocked_label_id_cache
     if _blocked_label_id_cache:
         return _blocked_label_id_cache
@@ -473,6 +465,7 @@ async def block_email_async(
     reasons: List[str] | None = None,
     score: int = 100,
 ) -> bool:
+    """Move um email para o lixo e adiciona label PHISHGUARD_BLOCKED."""
     token = await _get_access_token_async()
     if not token:
         return False
@@ -503,6 +496,7 @@ async def block_email_async(
 
 
 async def unblock_email_async(message_id: str) -> bool:
+    """Restaura um email do lixo para a caixa de entrada."""
     token = await _get_access_token_async()
     if not token:
         return False
@@ -538,6 +532,7 @@ async def _analyse_single_email(
     email_data: Dict,
     auto_block: bool = True,
 ) -> Optional[Dict]:
+    """Analisa um único email usando o motor híbrido."""
     msg_id  = email_data.get("id", "")
     subject = email_data.get("subject", "")
     sender  = email_data.get("sender", "")
@@ -630,6 +625,7 @@ async def _analyse_single_email(
 
 
 def _add_to_analysed_cache(result: Dict) -> None:
+    """Adiciona um resultado à cache de emails analisados."""
     global _analysed_cache
     email_id = result.get("email", {}).get("id", "")
 
@@ -656,79 +652,85 @@ async def scan_inbox(
     auto_block: bool = True,
     incremental: bool = False,
 ) -> List[Dict]:
-    global _last_scan_ts
+    """
+    Scan completo da caixa de entrada do Gmail.
+    Analisa cada email e bloqueia se phishing detectado.
+    """
+    global _last_scan_ts, _scan_running
+    _scan_running = True
 
-    token = await _get_access_token_async()
-    if not token:
-        logger.error(
-            "❌ Não foi possível autenticar com a Gmail API. "
-            "Verifique GMAIL_REFRESH_TOKEN no .env e logs acima."
-        )
-        return []
-
-    message_ids = await _list_message_ids(token, max_results, query)
-    if not message_ids:
-        logger.info("Nenhum email encontrado.")
-        return []
-
-    if incremental:
-        new_ids = [mid for mid in message_ids if mid not in _analysed_ids]
-        if not new_ids:
-            logger.info("Scan incremental: nenhum email novo.")
-            _last_scan_ts = time.monotonic()
+    try:
+        token = await _get_access_token_async()
+        if not token:
+            logger.error("❌ Não foi possível autenticar com a Gmail API.")
             return []
-        message_ids = new_ids
-        logger.info("Gmail: %d emails novos para análise.", len(message_ids))
-    else:
-        logger.info("Gmail: %d emails para análise.", len(message_ids))
 
-    semaphore = asyncio.Semaphore(10)
+        message_ids = await _list_message_ids(token, max_results, query)
+        if not message_ids:
+            logger.info("Nenhum email encontrado.")
+            return []
 
-    async def _fetch_with_sem(mid: str) -> Optional[Dict]:
-        async with semaphore:
-            return await _get_message_async(token, mid)
+        if incremental:
+            new_ids = [mid for mid in message_ids if mid not in _analysed_ids]
+            if not new_ids:
+                logger.info("Scan incremental: nenhum email novo.")
+                _last_scan_ts = time.monotonic()
+                return []
+            message_ids = new_ids
+            logger.info("Gmail: %d emails novos para análise.", len(message_ids))
+        else:
+            logger.info("Gmail: %d emails para análise.", len(message_ids))
 
-    fetch_tasks = [_fetch_with_sem(mid) for mid in message_ids]
-    email_data_list = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+        semaphore = asyncio.Semaphore(10)
 
-    analyse_sem = asyncio.Semaphore(3)
+        async def _fetch_with_sem(mid: str) -> Optional[Dict]:
+            async with semaphore:
+                return await _get_message_async(token, mid)
 
-    async def _analyse_with_sem(ed: Dict) -> Optional[Dict]:
-        async with analyse_sem:
-            result = await _analyse_single_email(ed, auto_block=auto_block)
-            if result:
-                _add_to_analysed_cache(result)
-            return result
+        fetch_tasks = [_fetch_with_sem(mid) for mid in message_ids]
+        email_data_list = await asyncio.gather(*fetch_tasks, return_exceptions=True)
 
-    analyse_tasks = [
-        _analyse_with_sem(ed)
-        for ed in email_data_list
-        if isinstance(ed, dict) and ed
-    ]
-    if not analyse_tasks:
-        return []
+        analyse_sem = asyncio.Semaphore(3)
 
-    results = await asyncio.gather(*analyse_tasks, return_exceptions=True)
+        async def _analyse_with_sem(ed: Dict) -> Optional[Dict]:
+            async with analyse_sem:
+                result = await _analyse_single_email(ed, auto_block=auto_block)
+                if result:
+                    _add_to_analysed_cache(result)
+                return result
 
-    final: List[Dict] = []
-    threats = 0
-    for r in results:
-        if isinstance(r, Exception):
-            logger.warning("Erro num email: %s", r)
-            continue
-        if r is not None:
-            final.append(r)
-            if r.get("analysis", {}).get("score", 0) >= 60:
-                threats += 1
+        analyse_tasks = [
+            _analyse_with_sem(ed)
+            for ed in email_data_list
+            if isinstance(ed, dict) and ed
+        ]
+        if not analyse_tasks:
+            return []
 
-    _last_scan_ts = time.monotonic()
-    logger.info("✅ Scan concluído: %d emails, %d ameaças", len(final), threats)
-    return final
+        results = await asyncio.gather(*analyse_tasks, return_exceptions=True)
+
+        final: List[Dict] = []
+        threats = 0
+        for r in results:
+            if isinstance(r, Exception):
+                logger.warning("Erro num email: %s", r)
+                continue
+            if r is not None:
+                final.append(r)
+                if r.get("analysis", {}).get("score", 0) >= 60:
+                    threats += 1
+
+        _last_scan_ts = time.monotonic()
+        logger.info("✅ Scan concluído: %d emails, %d ameaças", len(final), threats)
+        return final
+    finally:
+        _scan_running = False
 
 
 # ─── Background scan ─────────────────────────────────────────────
 
 async def _background_scan(max_results: int = 30, incremental: bool = True) -> None:
+    """Scan em background (não bloqueia o HTTP request)."""
     global _scan_running
     try:
         logger.info("Background scan iniciado (incremental=%s, max=%d)...",
@@ -748,6 +750,10 @@ async def _background_scan(max_results: int = 30, incremental: bool = True) -> N
 # ─── API pública ──────────────────────────────────────────────────
 
 async def get_all_analysed_emails(max_results: int = 100) -> List[Dict]:
+    """
+    Devolve todos os emails analisados.
+    Inicia scan em background se a cache estiver vazia.
+    """
     global _scan_running
 
     cache_expired = (time.monotonic() - _last_scan_ts) > _CACHE_TTL_SECS
@@ -764,6 +770,7 @@ async def get_all_analysed_emails(max_results: int = 100) -> List[Dict]:
 
 
 async def force_refresh(max_results: int = 30) -> List[Dict]:
+    """Força um scan completo e aguarda o resultado."""
     global _scan_running, _analysed_ids
     if not _scan_running:
         _scan_running = True
@@ -776,6 +783,7 @@ async def force_refresh(max_results: int = 30) -> List[Dict]:
 # ─── Emails bloqueados ────────────────────────────────────────────
 
 async def get_blocked_emails_async(max_results: int = 50) -> List[Dict]:
+    """Lista todos os emails bloqueados (com label PHISHGUARD_BLOCKED)."""
     token = await _get_access_token_async()
     if not token:
         return []

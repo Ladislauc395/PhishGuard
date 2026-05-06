@@ -18,12 +18,14 @@ from backend.core.database import get_session, engine
 from backend.models.analysis import Analysis
 from backend.services.orchestrator import orchestrate_email
 
-# importações do gmail_hook (nomes reais das funções async)
+# ═══ CORRECÇÃO v15: Usar gmail_hook para verificar conexão ═══
 from backend.services.gmail_hook import (
     scan_inbox,
     block_email_async,
     unblock_email_async,
     get_blocked_emails_async,
+    is_gmail_connected,          # ← NOVO
+    get_gmail_diagnostics,       # ← NOVO
     _get_access_token_async,
     _get_or_create_blocked_label,
     _auth_headers,
@@ -54,7 +56,6 @@ class ScanResult(BaseModel):
     analyses_ids: list[int]
 
 
-# Modelo v4 (suporta auto_blocked + results)
 class ScanResultV4(BaseModel):
     scanned: int
     threats_found: int
@@ -84,6 +85,24 @@ _state = {
 _monitor_task: Optional[asyncio.Task] = None
 
 
+# ═══ CORRECÇÃO v15: Inicializar estado do Gmail com is_gmail_connected() ═══
+# Verifica se o GMAIL_REFRESH_TOKEN está configurado no .env
+# e atualiza _state automaticamente no arranque.
+
+def _init_gmail_state():
+    """Inicializa o estado do Gmail baseado no refresh_token do .env."""
+    connected = is_gmail_connected()
+    _state["gmail_connected"] = connected
+    if connected:
+        logger.info("✅ Gmail conectado via refresh_token do .env")
+    else:
+        logger.warning("⚠️ Gmail NÃO conectado — refresh_token em falta ou inválido")
+    return connected
+
+# Inicializar ao importar o módulo
+_gmail_initialized = _init_gmail_state()
+
+
 # ─────────────────────────────────────────────────────────────────
 # Credentials helpers — originais
 # ─────────────────────────────────────────────────────────────────
@@ -96,7 +115,6 @@ def _gmail_creds() -> Credentials:
         client_id=settings.GMAIL_CLIENT_ID,
         client_secret=settings.GMAIL_CLIENT_SECRET,
     )
-    # Request() usa requests (síncrono) — só chamar dentro de to_thread()
     creds.refresh(Request())
     return creds
 
@@ -148,11 +166,10 @@ def _fetch_messages_sync(max_results: int, unread_only: bool = True):
 
 
 # ─────────────────────────────────────────────────────────────────
-# Lógica partilhada de scan (usada pelos endpoints GET e POST)
+# Lógica partilhada de scan
 # ─────────────────────────────────────────────────────────────────
 
 async def _run_scan_legacy(max_results: int) -> ScanResult:
-    """Pipeline original — preservado para retrocompatibilidade com POST."""
     if not _state["gmail_connected"]:
         raise HTTPException(400, "Gmail não conectado")
 
@@ -191,7 +208,6 @@ async def _run_scan_legacy(max_results: int) -> ScanResult:
 
 
 async def _run_scan_v4(max_results: int, auto_block: bool) -> ScanResultV4:
-    """Pipeline async v4 — análise em paralelo, sem bloquear o worker."""
     try:
         results = await scan_inbox(
             max_results=max_results,
@@ -216,11 +232,18 @@ async def _run_scan_v4(max_results: int, auto_block: bool) -> ScanResultV4:
 
 
 # ─────────────────────────────────────────────────────────────────
-# Endpoints — status e Gmail connect/disconnect (originais)
+# Endpoints — status
 # ─────────────────────────────────────────────────────────────────
 
 @router.get("/status", response_model=IntegrationStatus)
 async def status():
+    """
+    CORRIGIDO v15: Usa is_gmail_connected() do gmail_hook
+    para verificar o estado real do Gmail.
+    """
+    # Atualizar estado com a verificação real
+    _state["gmail_connected"] = is_gmail_connected()
+    
     return IntegrationStatus(
         gmail_connected=_state["gmail_connected"],
         gmail_email=_state["gmail_email"],
@@ -232,15 +255,46 @@ async def status():
     )
 
 
+# ═══ NOVO ENDPOINT: Diagnóstico Gmail ═══
+@router.get("/gmail/diagnostics")
+async def gmail_diagnostics():
+    """Diagnóstico detalhado do estado do Gmail."""
+    diag = get_gmail_diagnostics()
+    diag["gmail_connected"] = is_gmail_connected()
+    diag["refresh_token_configured"] = bool(settings.GMAIL_REFRESH_TOKEN)
+    diag["client_id_configured"] = bool(settings.GMAIL_CLIENT_ID)
+    diag["client_secret_configured"] = bool(settings.GMAIL_CLIENT_SECRET)
+    return diag
+
+
 @router.post("/gmail/connect")
 async def gmail_connect():
     """
-    Conecta ao Gmail via OAuth2.
-
-    CORRECÇÃO: _gmail_service() usa o Google SDK síncrono (requests bloqueante).
-    Envolto em asyncio.to_thread() para não bloquear o event loop do FastAPI
-    e evitar o TimeoutException no cliente Flutter (timeout 30 s).
+    CORRIGIDO v15: Verifica primeiro se já está conectado via refresh_token.
+    Se sim, apenas atualiza o estado e retorna.
     """
+    # Primeiro: verificar se já está conectado via .env
+    if is_gmail_connected():
+        _state["gmail_connected"] = True
+        # Tentar obter o email do perfil
+        try:
+            token = await _get_access_token_async()
+            if token:
+                async with __import__("httpx").AsyncClient(timeout=15) as c:
+                    r = await c.get(
+                        f"{GMAIL_API_BASE}/profile",
+                        headers=_auth_headers(token),
+                    )
+                    if r.status_code == 200:
+                        email = r.json().get("emailAddress")
+                        _state["gmail_email"] = email
+                        return {"ok": True, "email": email, "connected_via": "refresh_token"}
+        except Exception as e:
+            logger.warning("Erro ao obter perfil Gmail: %s", e)
+        
+        return {"ok": True, "email": _state.get("gmail_email"), "connected_via": "refresh_token"}
+    
+    # Se não estiver conectado via .env, tentar OAuth antigo
     def _connect_sync():
         svc = _gmail_service()
         profile = svc.users().getProfile(userId="me").execute()
@@ -249,7 +303,7 @@ async def gmail_connect():
     try:
         email = await asyncio.wait_for(
             asyncio.to_thread(_connect_sync),
-            timeout=25.0,  # margem antes do timeout de 30 s do Flutter
+            timeout=25.0,
         )
         _state["gmail_connected"] = True
         _state["gmail_email"] = email
@@ -279,21 +333,13 @@ async def gmail_disconnect():
 
 
 # ─────────────────────────────────────────────────────────────────
-# Scan Gmail — POST (original) + GET (correcção 405 para Flutter)
-#
-# CAUSA DO ERRO "405 Method Not Allowed":
-#   CORRECÇÃO v8 (NON-BLOCKING):
-#   Ambos POST e GET lançam o scan em BACKGROUND e devolvem imediatamente.
-#   O Flutter usa polling em /gmail/emails/all (scanning: true/false)
-#   para acompanhar o progresso — sem timeout no cliente.
+# Scan Gmail
 # ─────────────────────────────────────────────────────────────────
 
-# Task de scan em background (evita scans paralelos)
 _bg_scan_task: Optional[asyncio.Task] = None
 
 
 async def _bg_scan_background(max_results: int, auto_block: bool) -> None:
-    """Executa scan em background — não bloqueia o HTTP request."""
     global _bg_scan_task
     try:
         logger.info("Background scan iniciado (%d emails)...", max_results)
@@ -315,16 +361,10 @@ async def gmail_scan_post(
     max_results: int = Query(default=20, ge=1, le=50),
     auto_block: bool = Query(default=True),
 ):
-    """
-    CORRIGIDO v8: Lança scan em BACKGROUND e devolve imediatamente.
-    O Flutter usa polling em GET /gmail/emails/all para ver resultados.
-    Elimina o TimeoutException que ocorria porque o scan bloqueava por > 120 s.
-    """
     global _bg_scan_task
     if not _state.get("gmail_connected"):
         raise HTTPException(400, "Gmail não conectado")
     if _bg_scan_task and not _bg_scan_task.done():
-        # Scan já em curso — devolver resposta vazia
         return ScanResultV4(scanned=0, threats_found=0, auto_blocked=0, results=[])
     _bg_scan_task = asyncio.create_task(_bg_scan_background(max_results, auto_block))
     return ScanResultV4(scanned=0, threats_found=0, auto_blocked=0, results=[])
@@ -335,10 +375,6 @@ async def gmail_scan_get(
     max_results: int = Query(default=20, ge=1, le=50),
     auto_block: bool = Query(default=True),
 ):
-    """
-    CORRIGIDO v8: Lança scan em BACKGROUND e devolve imediatamente.
-    Mesmo comportamento que POST — sem bloquear o event loop.
-    """
     global _bg_scan_task
     if not _state.get("gmail_connected"):
         raise HTTPException(400, "Gmail não conectado")
@@ -349,7 +385,7 @@ async def gmail_scan_get(
 
 
 # ─────────────────────────────────────────────────────────────────
-# Monitor contínuo — original
+# Monitor contínuo
 # ─────────────────────────────────────────────────────────────────
 
 async def _gmail_monitor_loop(interval_seconds: int = 60):
@@ -420,7 +456,7 @@ async def sms_toggle(enabled: bool):
 
 
 # ═════════════════════════════════════════════════════════════════
-# PATCH v4 — Endpoints adicionais (não substituem nada)
+# PATCH v4 — Endpoints adicionais
 # ═════════════════════════════════════════════════════════════════
 
 @router.get("/gmail/scan/v2", response_model=ScanResultV4)
@@ -428,7 +464,6 @@ async def gmail_scan_v2(
     max_results: int = Query(default=10, ge=1, le=50),
     auto_block: bool = Query(default=True),
 ):
-    """[PATCH v4] Alias explícito para o pipeline async — mesmo que GET /gmail/scan."""
     return await _run_scan_v4(max_results=max_results, auto_block=auto_block)
 
 
@@ -436,7 +471,6 @@ async def gmail_scan_v2(
 async def gmail_get_blocked(
     max_results: int = Query(default=50, ge=1, le=200),
 ):
-    """[PATCH v4] Lista todos os emails bloqueados pelo PhishGuard."""
     try:
         blocked = await get_blocked_emails_async(max_results=max_results)
         return {"blocked": blocked, "total": len(blocked)}
@@ -451,7 +485,6 @@ async def gmail_block_email(
     reasons: list[str] = None,
     score: int = 100,
 ):
-    """[PATCH v4] Bloqueia manualmente um email (move para Lixo + label PHISHGUARD_BLOCKED)."""
     try:
         success = await block_email_async(
             message_id=message_id,
@@ -470,7 +503,6 @@ async def gmail_block_email(
 
 @router.post("/gmail/unblock/{message_id}")
 async def gmail_unblock_email(message_id: str):
-    """[PATCH v4] Restaura um email bloqueado para a caixa de entrada."""
     try:
         ok = await unblock_email_async(message_id)
         if not ok:

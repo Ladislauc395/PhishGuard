@@ -143,9 +143,9 @@ class _AllEmailsScreenState extends State<AllEmailsScreen>
   bool _refreshing = false;
   String? _error;
   bool _scanningInBackground = false;
-
-  // NOVO: estado de conectividade
   bool _gmailConnected = true;
+  int _pollAttempts = 0;
+  static const int _maxPollAttempts = 20;
 
   late TabController _tab;
   final _searchCtrl = TextEditingController();
@@ -173,6 +173,7 @@ class _AllEmailsScreenState extends State<AllEmailsScreen>
       _error = null;
       _scanningInBackground = false;
       _gmailConnected = true;
+      _pollAttempts = 0;
     });
     try {
       final response = await _svc.getAllAnalysedEmailsWithStatus().timeout(
@@ -187,13 +188,16 @@ class _AllEmailsScreenState extends State<AllEmailsScreen>
         _scanningInBackground = response.scanning;
       });
 
-      if (response.scanning) {
+      // Só faz polling se houver scan em background E a cache estiver vazia
+      if (response.scanning && _all.isEmpty) {
         _pollUntilScanDone();
+      } else if (response.scanning && _all.isNotEmpty) {
+        // Já temos dados em cache, mostrar imediatamente
+        setState(() => _scanningInBackground = false);
       }
     } catch (e) {
       if (!mounted) return;
       final errStr = e.toString();
-      // Detectar se é erro de Gmail não conectado (403)
       final isNotConnected = errStr.contains('403') ||
           errStr.contains('Gmail não conectado') ||
           errStr.contains('não conectado');
@@ -209,6 +213,7 @@ class _AllEmailsScreenState extends State<AllEmailsScreen>
     setState(() {
       _refreshing = true;
       _error = null;
+      _pollAttempts = 0;
     });
     try {
       final response = await _svc.forceRefresh(maxResults: 30).timeout(
@@ -224,7 +229,7 @@ class _AllEmailsScreenState extends State<AllEmailsScreen>
         _refreshing = false;
       });
 
-      if (response.scanning) {
+      if (response.scanning && _all.isEmpty) {
         _pollUntilScanDone();
       }
     } catch (e) {
@@ -237,7 +242,8 @@ class _AllEmailsScreenState extends State<AllEmailsScreen>
   }
 
   Future<void> _pollUntilScanDone() async {
-    for (int attempt = 0; attempt < 60 && mounted; attempt++) {
+    for (int attempt = 0; attempt < _maxPollAttempts && mounted; attempt++) {
+      _pollAttempts = attempt + 1;
       await Future.delayed(const Duration(seconds: 3));
       if (!mounted) break;
 
@@ -253,8 +259,17 @@ class _AllEmailsScreenState extends State<AllEmailsScreen>
           _scanningInBackground = response.scanning;
         });
 
+        // Parar polling se:
+        // - Scan terminou (scanning=false)
+        // - Já temos emails e não está a scanear
         if (!response.scanning) break;
-      } catch (_) {}
+        if (_all.isNotEmpty && attempt >= 3) {
+          setState(() => _scanningInBackground = false);
+          break;
+        }
+      } catch (_) {
+        break;
+      }
     }
 
     if (mounted) setState(() => _scanningInBackground = false);
@@ -316,7 +331,6 @@ class _AllEmailsScreenState extends State<AllEmailsScreen>
     }
   }
 
-  /// Bloquear manualmente um email (mover para lixo + label PHISHGUARD_BLOCKED)
   Future<void> _blockEmail(AnalysedEmail email) async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -413,42 +427,42 @@ class _AllEmailsScreenState extends State<AllEmailsScreen>
           ),
         ),
         actions: [
-          _refreshing
-              ? const Padding(
-                  padding: EdgeInsets.all(14),
-                  child: SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                )
-              : PopupMenuButton<String>(
-                  icon: const Icon(Icons.refresh_rounded,
-                      color: Color(0xFF1A1A2E)),
-                  tooltip: 'Actualizar',
-                  onSelected: (value) {
-                    if (value == 'quick') _load();
-                    if (value == 'full') _forceRefresh();
-                  },
-                  itemBuilder: (_) => [
-                    const PopupMenuItem(
-                      value: 'quick',
-                      child: Row(children: [
-                        Icon(Icons.cached_rounded, size: 18),
-                        SizedBox(width: 8),
-                        Text('Atualizar cache'),
-                      ]),
-                    ),
-                    const PopupMenuItem(
-                      value: 'full',
-                      child: Row(children: [
-                        Icon(Icons.sync_rounded, size: 18),
-                        SizedBox(width: 8),
-                        Text('Scan completo (30 emails)'),
-                      ]),
-                    ),
-                  ],
+          if (_refreshing || _scanningInBackground)
+            const Padding(
+              padding: EdgeInsets.all(14),
+              child: SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            )
+          else
+            PopupMenuButton<String>(
+              icon: const Icon(Icons.refresh_rounded, color: Color(0xFF1A1A2E)),
+              tooltip: 'Actualizar',
+              onSelected: (value) {
+                if (value == 'quick') _load();
+                if (value == 'full') _forceRefresh();
+              },
+              itemBuilder: (_) => [
+                const PopupMenuItem(
+                  value: 'quick',
+                  child: Row(children: [
+                    Icon(Icons.cached_rounded, size: 18),
+                    SizedBox(width: 8),
+                    Text('Atualizar cache'),
+                  ]),
                 ),
+                const PopupMenuItem(
+                  value: 'full',
+                  child: Row(children: [
+                    Icon(Icons.sync_rounded, size: 18),
+                    SizedBox(width: 8),
+                    Text('Scan completo (30 emails)'),
+                  ]),
+                ),
+              ],
+            ),
         ],
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(48),
@@ -497,10 +511,6 @@ class _AllEmailsScreenState extends State<AllEmailsScreen>
     );
   }
 
-  // ── Ecrã de Gmail não conectado ──────────────────────────────────
-  // NOTA: Se o GMAIL_REFRESH_TOKEN estiver no .env, o Gmail JÁ está conectado
-  // e este ecrã não deve aparecer. Se aparecer, verificar os logs do backend.
-
   Widget _buildGmailNotConnected() {
     return Center(
       child: Padding(
@@ -542,19 +552,6 @@ class _AllEmailsScreenState extends State<AllEmailsScreen>
                 padding:
                     const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
               ),
-            ),
-            const SizedBox(height: 12),
-            TextButton(
-              onPressed: () {
-                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                  content: Text(
-                    'Acede a http://10.249.221.68:8000/auth/gmail/url no browser '
-                    'para reconectar o Gmail',
-                  ),
-                  duration: Duration(seconds: 8),
-                ));
-              },
-              child: const Text('Reconectar Gmail manualmente'),
             ),
           ],
         ),
@@ -620,18 +617,28 @@ class _AllEmailsScreenState extends State<AllEmailsScreen>
         width: double.infinity,
         padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
         color: AppColors.warning.withOpacity(0.1),
-        child: const Row(
+        child: Row(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            SizedBox(
+            const SizedBox(
               width: 12,
               height: 12,
               child: CircularProgressIndicator(
                   strokeWidth: 2, color: AppColors.warning),
             ),
-            SizedBox(width: 10),
-            Text('Scan em background...',
-                style: TextStyle(color: AppColors.warning, fontSize: 12)),
+            const SizedBox(width: 10),
+            Text(
+              _scanningInBackground
+                  ? 'Scan em background... (${(_pollAttempts * 3).clamp(0, 60)}s)'
+                  : 'A processar...',
+              style: const TextStyle(color: AppColors.warning, fontSize: 12),
+            ),
+            if (_pollAttempts >= 15)
+              TextButton(
+                onPressed: () => setState(() => _scanningInBackground = false),
+                child: const Text('Parar',
+                    style: TextStyle(fontSize: 11, color: AppColors.danger)),
+              ),
           ],
         ),
       );
@@ -684,13 +691,15 @@ class _AllEmailsScreenState extends State<AllEmailsScreen>
     if (list.isEmpty) {
       final emptyMsg = _query.isNotEmpty
           ? 'Nenhum resultado para "$_query"'
-          : filter == null
-              ? 'Nenhum email analisado ainda.\nCarregue no ícone de refresh para iniciar o scan.'
-              : filter == EmailVerdict.blocked
-                  ? '✅ Nenhum email bloqueado'
-                  : filter == EmailVerdict.suspicious
-                      ? '✅ Nenhum email suspeito'
-                      : '✅ Todos os emails seguros';
+          : _scanningInBackground
+              ? 'A analisar emails...\nAguarde enquanto o scan está em curso.'
+              : filter == null
+                  ? 'Nenhum email analisado ainda.\nToque em refresh → Scan completo para iniciar.'
+                  : filter == EmailVerdict.blocked
+                      ? '✅ Nenhum email bloqueado'
+                      : filter == EmailVerdict.suspicious
+                          ? '✅ Nenhum email suspeito'
+                          : '✅ Todos os emails seguros';
       return Center(
         child: Padding(
           padding: const EdgeInsets.all(32),
@@ -698,11 +707,13 @@ class _AllEmailsScreenState extends State<AllEmailsScreen>
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               Icon(
-                filter == EmailVerdict.blocked
-                    ? Icons.block_rounded
-                    : filter == EmailVerdict.suspicious
-                        ? Icons.warning_amber_rounded
-                        : Icons.mark_email_read_outlined,
+                _scanningInBackground
+                    ? Icons.hourglass_empty_rounded
+                    : filter == EmailVerdict.blocked
+                        ? Icons.block_rounded
+                        : filter == EmailVerdict.suspicious
+                            ? Icons.warning_amber_rounded
+                            : Icons.mark_email_read_outlined,
                 size: 48,
                 color: AppColors.textMuted.withOpacity(0.4),
               ),

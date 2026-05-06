@@ -45,7 +45,7 @@ class ApiClient {
   })  : baseUrl = baseUrl ??
             const String.fromEnvironment(
               'API_URL',
-              defaultValue: 'http://10.249.221.68:8000',
+              defaultValue: 'http://10.26.54.68:8000',
             ),
         _http = httpClient ?? http.Client(),
         _storage = storage ?? const FlutterSecureStorage();

@@ -16,7 +16,6 @@ from backend.models.brand import BrandProfile
 from backend.models.email import Email
 from backend.models.sms import SMS
 
-# Importação centralizada do Orquestrador
 from backend.services.orchestrator import (
     orchestrate_url, 
     orchestrate_sms, 
@@ -26,8 +25,6 @@ from backend.services.orchestrator import (
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/analyze", tags=["analyze"])
 
-
-# ─── Schemas ──────────────────────────────────────────────────────
 
 class AnalyzeURLRequest(BaseModel):
     url: str = Field(min_length=4, max_length=2048, examples=["https://bai.ao/login"])
@@ -70,15 +67,12 @@ class AnalyzeResponse(BaseModel):
     timestamp: datetime
 
 
-# ─── URL ──────────────────────────────────────────────────────────
-
 @router.post("/url", response_model=AnalyzeResponse)
 async def analyze_url(
     payload: AnalyzeURLRequest,
     session: Session = Depends(get_session),
 ) -> AnalyzeResponse:
     try:
-        # CHAMADA CORRIGIDA: Agora usa o orquestrador com APIs externas
         result = await orchestrate_url(payload.url)
 
         analysis = Analysis(
@@ -86,7 +80,7 @@ async def analyze_url(
             channel="web",
             score=result["score"],
             verdict=result["verdict"],
-            details=result, # Guardamos o dict completo do orquestrador
+            details=result,
         )
         session.add(analysis)
         session.commit()
@@ -96,7 +90,7 @@ async def analyze_url(
             score=result["score"],
             verdict=result["verdict"],
             classification="phishing" if result["score"] >= 60 else "safe",
-            reasons=result.get("reasons", ["no_signals"]),
+            reasons=result.get("reasons", ["no_threats_detected"]),
             details=result,
             analysis_id=analysis.id,
             timestamp=analysis.timestamp,
@@ -108,8 +102,6 @@ async def analyze_url(
             detail=f"Erro interno na análise de URL: {str(exc)}",
         )
 
-
-# ─── SMS ──────────────────────────────────────────────────────────
 
 @router.post("/sms", response_model=AnalyzeResponse)
 async def analyze_sms(
@@ -123,7 +115,6 @@ async def analyze_sms(
         if not body:
             raise HTTPException(status_code=422, detail="Corpo do SMS vazio")
 
-        # Chama o orquestrador (IA + URL Scan)
         result = await orchestrate_sms(body, sender)
 
         analysis = Analysis(
@@ -158,8 +149,6 @@ async def analyze_sms(
         raise HTTPException(status_code=500, detail="Erro no processamento de SMS")
 
 
-# ─── Email ────────────────────────────────────────────────────────
-
 @router.post("/email", response_model=AnalyzeResponse)
 async def analyze_email_endpoint(
     payload: AnalyzeEmailRequest,
@@ -168,7 +157,6 @@ async def analyze_email_endpoint(
     try:
         headers = payload.resolved_headers
         
-        # Chama o orquestrador (DNS + IA + URL Scan)
         result = await orchestrate_email(str(payload.sender), headers, payload.body)
 
         analysis = Analysis(

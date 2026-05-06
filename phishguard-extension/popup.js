@@ -1,20 +1,16 @@
 /**
  * PhishGuard Angola — popup.js
- *
- * CORREÇÕES:
- *  - URL padrão da API alterada para http://10.249.221.68:8000
- *  - checkApiStatus aponta para /extension/health
- *  - sendMsg com timeout para evitar popup a travar
- *  - loadHistory mostra stats correctamente
- *  - checkCurrentTab ignora URLs de extensão e chrome://
+ * CORRIGIDO: event listeners em vez de onclick inline
  */
-
-const DEFAULT_API_BASE = "http://10.249.221.68:8000";
+const DEFAULT_API_BASE = "http://10.26.54.68:8000";
 
 document.addEventListener("DOMContentLoaded", async () => {
   setupTabs();
   setupToggle();
   setupScanButton();
+  setupSaveButton();
+  setupClearButton();
+  setupDashboardButton();
   await Promise.all([
     loadSettings(),
     loadHistory(),
@@ -35,40 +31,80 @@ async function loadSettings() {
   safeSet("s-warn-threshold",    el => el.value   = s.warnThreshold  || 30);
   safeSet("s-check-links",       el => el.checked = s.checkLinks !== false);
   safeSet("s-notifications",     el => el.checked = s.showNotifications !== false);
-  // CORRIGIDO: fallback para IP real em vez de localhost
   safeSet("s-api-url",           el => el.value   = s.apiBase || DEFAULT_API_BASE);
 }
 
-window.saveSettings = async function () {
-  const settings = {
-    enabled:           document.getElementById("toggle-enabled").checked,
-    blockThreshold:    parseInt(document.getElementById("s-block-threshold").value, 10) || 60,
-    warnThreshold:     parseInt(document.getElementById("s-warn-threshold").value,  10) || 30,
-    checkLinks:        document.getElementById("s-check-links").checked,
-    showNotifications: document.getElementById("s-notifications").checked,
-    // CORRIGIDO: fallback para IP real em vez de localhost
-    apiBase:           (document.getElementById("s-api-url").value || "").trim() || DEFAULT_API_BASE,
-  };
-  await sendMsg("SET_SETTINGS", { settings });
-  showToast("✅ Definições guardadas!");
-};
+// ─── Botão Guardar ───────────────────────────────────────────────
 
-window.clearHistory = async function () {
-  if (!confirm("Limpar todo o histórico de verificações?")) return;
-  await sendMsg("CLEAR_HISTORY");
-  await sendMsg("CLEAR_CACHE");
-  const list = document.getElementById("history-list");
-  if (list) list.innerHTML = '<div style="color:#3a2c5a;font-size:12px;padding:10px 0;text-align:center;">Histórico limpo</div>';
-  safeSet("stat-total", el => el.textContent = "0");
-  safeSet("stat-warn",  el => el.textContent = "0");
-  safeSet("stat-block", el => el.textContent = "0");
-};
+function setupSaveButton() {
+  const btn = document.getElementById("btn-save-settings");
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    const apiUrlInput = document.getElementById("s-api-url");
+    let apiBase = (apiUrlInput?.value || "").trim();
+    
+    if (!apiBase) {
+      apiBase = DEFAULT_API_BASE;
+      if (apiUrlInput) apiUrlInput.value = apiBase;
+    }
+    
+    apiBase = apiBase.replace(/\/+$/, "");
+    
+    if (!apiBase.startsWith("http://") && !apiBase.startsWith("https://")) {
+      apiBase = "http://" + apiBase;
+      if (apiUrlInput) apiUrlInput.value = apiBase;
+    }
 
-window.openDashboard = function () {
-  // CORRIGIDO: fallback para IP real em vez de localhost
-  const apiBase = (document.getElementById("s-api-url")?.value || DEFAULT_API_BASE).trim();
-  chrome.tabs.create({ url: apiBase + "/docs" });
-};
+    const settings = {
+      enabled:           document.getElementById("toggle-enabled").checked,
+      blockThreshold:    parseInt(document.getElementById("s-block-threshold").value, 10) || 60,
+      warnThreshold:     parseInt(document.getElementById("s-warn-threshold").value,  10) || 30,
+      checkLinks:        document.getElementById("s-check-links").checked,
+      showNotifications: document.getElementById("s-notifications").checked,
+      apiBase:           apiBase,
+    };
+
+    btn.disabled = true;
+    btn.textContent = "⏳ A guardar...";
+
+    await sendMsg("SET_SETTINGS", { settings });
+    await checkApiStatus();
+    await checkCurrentTab();
+    
+    showToast("✅ Definições guardadas!");
+    
+    btn.disabled = false;
+    btn.textContent = "💾 Guardar Definições";
+  });
+}
+
+// ─── Botão Limpar ────────────────────────────────────────────────
+
+function setupClearButton() {
+  const btn = document.getElementById("btn-clear-history");
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    if (!confirm("Limpar todo o histórico de verificações?")) return;
+    await sendMsg("CLEAR_HISTORY");
+    await sendMsg("CLEAR_CACHE");
+    const list = document.getElementById("history-list");
+    if (list) list.innerHTML = '<div style="color:#3a2c5a;font-size:12px;padding:10px 0;text-align:center;">Histórico limpo</div>';
+    safeSet("stat-total", el => el.textContent = "0");
+    safeSet("stat-warn",  el => el.textContent = "0");
+    safeSet("stat-block", el => el.textContent = "0");
+  });
+}
+
+// ─── Botão Dashboard ─────────────────────────────────────────────
+
+function setupDashboardButton() {
+  const btn = document.getElementById("btn-dashboard");
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    const apiBase = (document.getElementById("s-api-url")?.value || DEFAULT_API_BASE).trim().replace(/\/+$/, "");
+    chrome.tabs.create({ url: apiBase + "/docs" });
+  });
+}
 
 // ─── Toggle ──────────────────────────────────────────────────────
 
@@ -92,7 +128,6 @@ async function checkCurrentTab() {
 
   const url = tab.url;
 
-  // Ignorar páginas internas
   if (url.startsWith("chrome://") || url.startsWith("chrome-extension://") ||
       url.startsWith("about:") || url.startsWith("edge://")) {
     setCurrentUrl(url);
@@ -176,8 +211,7 @@ async function loadHistory() {
 
 async function checkApiStatus() {
   const settings = await sendMsg("GET_SETTINGS");
-  // CORRIGIDO: fallback para IP real em vez de localhost
-  const apiBase  = (settings?.apiBase || DEFAULT_API_BASE).trim();
+  const apiBase  = (settings?.apiBase || DEFAULT_API_BASE).trim().replace(/\/+$/, "");
   const dot      = document.getElementById("api-dot");
   const txt      = document.getElementById("api-status-text");
   if (!dot || !txt) return;
@@ -255,18 +289,17 @@ function escHtml(s) {
 }
 
 function showToast(msg) {
+  const existing = document.querySelector(".pg-toast");
+  if (existing) existing.remove();
+
   const t = document.createElement("div");
-  t.style.cssText = [
-    "position:fixed", "bottom:14px", "left:50%", "transform:translateX(-50%)",
-    "background:#4a1fa8", "color:#fff", "padding:7px 18px", "border-radius:20px",
-    "font-size:12px", "font-weight:600", "z-index:9999", "pointer-events:none",
-  ].join(";");
+  t.className = "pg-toast";
+  t.style.cssText = "position:fixed;bottom:14px;left:50%;transform:translateX(-50%);background:#4a1fa8;color:#fff;padding:7px 18px;border-radius:20px;font-size:12px;font-weight:600;z-index:9999;pointer-events:none;";
   t.textContent = msg;
   document.body.appendChild(t);
   setTimeout(() => t.remove(), 2000);
 }
 
-// sendMsg com timeout de 8s para não travar o popup
 function sendMsg(type, extra = {}) {
   return new Promise((resolve) => {
     const timer = setTimeout(() => resolve(null), 8000);
