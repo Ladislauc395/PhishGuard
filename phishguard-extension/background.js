@@ -199,3 +199,4 @@ function shortUrl(url) {
 
 console.log("[PhishGuard] Service Worker iniciado ✅ — API:", DEFAULT_API_BASE);
 
+

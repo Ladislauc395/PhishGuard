@@ -22,8 +22,11 @@ dependencies:
   flutter_secure_storage: ^9.0.0  # Armazenar token JWT encriptado
   http: ^1.2.1                    # Chamadas HTTP (se não tiver já)
   jose: ^0.3.5 
-  shared_preferences: ^2.2.3                   
- 
+  shared_preferences: ^2.2.3   
+  web_socket_channel: ^2.4.0            
+  firebase_core: ^2.24.0
+  firebase_messaging: ^14.7.0
+  flutter_local_notifications: ^18.0.0
 
 flutter:
   uses-material-design: true

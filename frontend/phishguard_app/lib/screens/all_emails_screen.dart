@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import '../core/theme.dart';
 import '../services/integrations_service.dart';
@@ -89,13 +90,18 @@ class AnalysedEmail {
     if (r.contains('virustotal')) return '🦠 Detectado pelo VirusTotal';
     if (r.contains('google_safe') || r.contains('safe_browsing'))
       return '🔴 Google Safe Browsing alerta';
+    if (r.contains('phishtank')) return '🎣 PhishTank: phishing confirmado';
+    if (r.contains('urlscan')) return '🔍 URLScan.io: URL maliciosa';
+    if (r.contains('abuseipdb')) return '🌐 AbuseIPDB: IP reportado';
+    if (r.contains('dnsbl')) return '📋 DNSBL: domínio em lista negra';
     if (r.contains('spoof_known') ||
         r.contains('display_name_spoof') ||
         r.contains('spoof')) return '🎭 Imitação de marca conhecida';
     if (r.contains('typosquatting')) return '🔤 Domínio falso (typosquatting)';
     if (r.contains('auth_fail')) return '🔐 Falha SPF/DKIM/DMARC';
     if (r.contains('SPF falhou')) return '🔐 SPF falhou';
-    if (r.contains('DKIM falhou')) return '🔐 DKIM falhou';
+    if (r.contains('DKIM não verificado') || r.contains('DKIM falhou'))
+      return '🔐 DKIM falhou';
     if (r.contains('DMARC falhou')) return '🔐 DMARC falhou';
     if (r.contains('suspicious_link') ||
         r.contains('Link malicioso') ||
@@ -151,6 +157,8 @@ class _AllEmailsScreenState extends State<AllEmailsScreen>
   final _searchCtrl = TextEditingController();
   String _query = '';
 
+  Timer? _autoRefreshTimer; // <-- NOVO para atualização automática
+
   @override
   void initState() {
     super.initState();
@@ -158,13 +166,24 @@ class _AllEmailsScreenState extends State<AllEmailsScreen>
     _searchCtrl.addListener(
         () => setState(() => _query = _searchCtrl.text.toLowerCase()));
     _load();
+    _startAutoRefresh(); // <-- inicia o timer
   }
 
   @override
   void dispose() {
+    _autoRefreshTimer?.cancel(); // <-- cancela o timer
     _tab.dispose();
     _searchCtrl.dispose();
     super.dispose();
+  }
+
+  void _startAutoRefresh() {
+    _autoRefreshTimer?.cancel();
+    _autoRefreshTimer = Timer.periodic(const Duration(seconds: 10), (_) {
+      if (!_loading && !_refreshing && !_scanningInBackground) {
+        _load();
+      }
+    });
   }
 
   Future<void> _load() async {
@@ -188,11 +207,9 @@ class _AllEmailsScreenState extends State<AllEmailsScreen>
         _scanningInBackground = response.scanning;
       });
 
-      // Só faz polling se houver scan em background E a cache estiver vazia
       if (response.scanning && _all.isEmpty) {
         _pollUntilScanDone();
       } else if (response.scanning && _all.isNotEmpty) {
-        // Já temos dados em cache, mostrar imediatamente
         setState(() => _scanningInBackground = false);
       }
     } catch (e) {
@@ -259,9 +276,6 @@ class _AllEmailsScreenState extends State<AllEmailsScreen>
           _scanningInBackground = response.scanning;
         });
 
-        // Parar polling se:
-        // - Scan terminou (scanning=false)
-        // - Já temos emails e não está a scanear
         if (!response.scanning) break;
         if (_all.isNotEmpty && attempt >= 3) {
           setState(() => _scanningInBackground = false);

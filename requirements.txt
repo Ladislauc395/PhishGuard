@@ -35,7 +35,7 @@ scikit-learn>=1.4.0          # RandomForest, VotingClassifier, Pipeline
 xgboost>=2.0.0               # Gradient Boosting (XGBClassifier)
 numpy>=1.26.0                # Arrays numéricos (required pelo sklearn)
 pandas>=2.1.0                # Manipulação de dados (datasets CSV)
-
+firebase_admin=>7.4.0-
 dkim>=1.1.7                # Verificação de assinatura DKIM (python-dkim)
 # Para DMARC: dnspython já cobre os TXT records _dmarc
  

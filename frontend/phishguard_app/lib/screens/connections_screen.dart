@@ -2,10 +2,11 @@
 //
 // Ecrã de Ligações — PhishGuard Angola
 //
-// CORRECÇÕES v12:
-//   - Tema WHITE/BLUE restaurado (era dark 0xFF0F1117, agora 0xFFF8F9FB)
-//   - Gmail OAuth usa LaunchMode.inAppWebView (não abre browser externo)
-//   - AppBar branco com texto escuro, consistente com AllEmailsScreen
+// CORRECÇÕES v14:
+//   - Secção Gmail sem botões manuais: ao tocar no cartão (se conectado)
+//     abre directamente a lista de emails analisados.
+//   - Se não estiver conectado, mostra mensagem informativa.
+//   - Todos os métodos auxiliares estão presentes.
 
 import 'dart:async';
 import 'package:flutter/material.dart';
@@ -18,12 +19,12 @@ import 'all_emails_screen.dart';
 
 // ─── Paleta de cores clara (White / Blue) ────────────────────────
 
-const _kBg = Color(0xFFF8F9FB); // fundo geral
-const _kCard = Colors.white; // cartões
-const _kBlue = Color(0xFF3B82F6); // azul principal
-const _kTextDark = Color(0xFF1A1A2E); // texto escuro
-const _kTextMuted = Color(0xFF6B7280); // texto secundário
-const _kBorder = Color(0xFFE5E7EB); // bordas suaves
+const _kBg = Color(0xFFF8F9FB);
+const _kCard = Colors.white;
+const _kBlue = Color(0xFF3B82F6);
+const _kTextDark = Color(0xFF1A1A2E);
+const _kTextMuted = Color(0xFF6B7280);
+const _kBorder = Color(0xFFE5E7EB);
 const _kGreen = Color(0xFF10B981);
 const _kRed = Color(0xFFEF4444);
 
@@ -39,23 +40,17 @@ class _ConnectionsScreenState extends State<ConnectionsScreen>
   final _integrations = IntegrationsService();
   final _extensionSvc = ExtensionService();
 
-  // Estado
   IntegrationStatus _status = IntegrationStatus.disconnected();
   ExtensionStatus _extStatus = ExtensionStatus.offline();
   ExtensionStats _extStats = ExtensionStats.empty();
 
-  bool _loadingGmail = false;
   bool _loadingExtension = false;
   bool _loadingUrlCheck = false;
-  String? _gmailError;
   String? _extError;
 
-  // Teste de URL
   final _urlController = TextEditingController();
   UrlCheckResult? _urlCheckResult;
 
-  // Expansão das secções
-  bool _gmailExpanded = true;
   bool _smsExpanded = false;
   bool _chromeExpanded = true;
 
@@ -99,71 +94,7 @@ class _ConnectionsScreenState extends State<ConnectionsScreen>
     }
   }
 
-  // ── Gmail actions ────────────────────────────────────────────────
-
-  /// CORRIGIDO v13: NÃO abre nenhum browser nem WebView.
-  /// Como o GMAIL_REFRESH_TOKEN já está no .env, o Gmail já está conectado.
-  /// Este botão apenas verifica o estado e navega para AllEmailsScreen.
-  Future<void> _connectGmail() async {
-    setState(() {
-      _loadingGmail = true;
-      _gmailError = null;
-    });
-    try {
-      // Verificar se já está conectado via refresh_token no .env
-      await _loadStatus();
-
-      if (_status.gmailConnected) {
-        // Já conectado: navegar directamente para os emails
-        _showSnack('✅ Gmail conectado! A abrir emails...');
-        await Future.delayed(const Duration(milliseconds: 600));
-        if (mounted) {
-          Navigator.push(
-            context,
-            MaterialPageRoute(builder: (_) => const AllEmailsScreen()),
-          );
-        }
-      } else {
-        // Não conectado: mostrar instruções inline (sem abrir browser)
-        setState(() {
-          _gmailError =
-              'Gmail não conectado. Certifica-te que GMAIL_REFRESH_TOKEN '
-              'está configurado no ficheiro .env do servidor e reinicia o backend.';
-        });
-      }
-    } catch (e) {
-      if (mounted) setState(() => _gmailError = e.toString());
-    } finally {
-      if (mounted) setState(() => _loadingGmail = false);
-    }
-  }
-
-  Future<void> _disconnectGmail() async {
-    setState(() => _loadingGmail = true);
-    try {
-      await _integrations.disconnectGmail();
-      await _loadStatus();
-    } catch (e) {
-      if (mounted) setState(() => _gmailError = e.toString());
-    } finally {
-      if (mounted) setState(() => _loadingGmail = false);
-    }
-  }
-
-  Future<void> _scanGmail() async {
-    setState(() => _loadingGmail = true);
-    try {
-      await _integrations.scanGmail(maxResults: 20);
-      _showSnack('✅ Scan iniciado em segundo plano');
-      await _loadStatus();
-    } catch (e) {
-      _showSnack('Erro: ${e.toString()}', isError: true);
-    } finally {
-      if (mounted) setState(() => _loadingGmail = false);
-    }
-  }
-
-  // ── SMS actions ──────────────────────────────────────────────────
+  // ── SMS toggle ──────────────────────────────────────────────────
 
   Future<void> _toggleSms(bool enabled) async {
     try {
@@ -174,7 +105,7 @@ class _ConnectionsScreenState extends State<ConnectionsScreen>
     }
   }
 
-  // ── Extension: URL check ─────────────────────────────────────────
+  // ── URL check (extensão) ────────────────────────────────────────
 
   Future<void> _checkUrl() async {
     final url = _urlController.text.trim();
@@ -268,12 +199,19 @@ class _ConnectionsScreenState extends State<ConnectionsScreen>
     );
   }
 
-  // ── SECÇÃO GMAIL ─────────────────────────────────────────────────
+  // ── SECÇÃO GMAIL (APENAS INFORMAÇÃO, SEM BOTÕES) ───────────────
 
   Widget _buildGmailSection() {
     final connected = _status.gmailConnected;
     return _buildCard(
-      onTap: () => setState(() => _gmailExpanded = !_gmailExpanded),
+      onTap: () {
+        if (connected) {
+          Navigator.push(
+            context,
+            MaterialPageRoute(builder: (_) => const AllEmailsScreen()),
+          );
+        }
+      },
       header: Row(
         children: [
           _buildServiceIcon(
@@ -306,95 +244,46 @@ class _ConnectionsScreenState extends State<ConnectionsScreen>
             ),
           ),
           _buildStatusBadge(connected ? 'ACTIVO' : 'INACTIVO', connected),
-          const SizedBox(width: 8),
-          Icon(
-            _gmailExpanded ? Icons.expand_less : Icons.expand_more,
-            color: _kTextMuted,
-          ),
+          if (connected)
+            const Padding(
+              padding: EdgeInsets.only(left: 8),
+              child: Icon(Icons.arrow_forward_ios_rounded, size: 16, color: _kTextMuted),
+            ),
         ],
       ),
-      body: _gmailExpanded ? _buildGmailBody(connected) : null,
-    );
-  }
-
-  Widget _buildGmailBody(bool connected) {
-    return Column(
-      children: [
-        if (_gmailError != null) _buildErrorBanner(_gmailError!),
-        const SizedBox(height: 12),
-        if (!connected)
-          Column(
-            children: [
-              _buildActionButton(
-                label: 'Verificar Ligação Gmail',
-                icon: Icons.check_circle_outline_rounded,
-                color: _kBlue,
-                loading: _loadingGmail,
-                onPressed: _connectGmail,
-              ),
-              const SizedBox(height: 8),
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: _kBlue.withOpacity(0.05),
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: _kBlue.withOpacity(0.2)),
+      body: connected
+          ? Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (_status.lastScanAt != null)
+                  _buildInfoRow('Último scan', _status.lastScanAt!),
+                if (_status.lastScanThreats > 0)
+                  _buildInfoRow(
+                    'Ameaças encontradas',
+                    '${_status.lastScanThreats}',
+                    valueColor: Colors.orange[700],
+                  ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Toque no cartão para ver todos os emails analisados.',
+                  style: TextStyle(color: _kTextMuted, fontSize: 12),
                 ),
-                child: const Text(
-                  'ℹ️ O Gmail liga automaticamente via token configurado no servidor. '
-                  'Não é necessário abrir nenhum browser.',
-                  style: TextStyle(color: _kTextMuted, fontSize: 12, height: 1.4),
+              ],
+            )
+          : Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const SizedBox(height: 8),
+                const Text(
+                  'O Gmail não está conectado.\n\n'
+                  'Certifique-se de que as variáveis '
+                  'GMAIL_REFRESH_TOKEN, GMAIL_CLIENT_ID e '
+                  'GMAIL_CLIENT_SECRET estão configuradas no ficheiro .env '
+                  'do servidor e reinicie o backend.',
+                  style: TextStyle(color: _kTextMuted, fontSize: 13, height: 1.5),
                 ),
-              ),
-            ],
-          )
-        else ...[
-          if (_status.lastScanAt != null)
-            _buildInfoRow('Último scan', _status.lastScanAt!),
-          if (_status.lastScanThreats > 0)
-            _buildInfoRow(
-              'Ameaças encontradas',
-              '${_status.lastScanThreats}',
-              valueColor: Colors.orange[700],
+              ],
             ),
-          const SizedBox(height: 8),
-          // Botão principal: ver emails (navega para AllEmailsScreen)
-          _buildActionButton(
-            label: '📬 Ver Emails Analisados',
-            icon: Icons.inbox_rounded,
-            color: _kBlue,
-            loading: _loadingGmail,
-            onPressed: () => Navigator.push(
-              context,
-              MaterialPageRoute(builder: (_) => const AllEmailsScreen()),
-            ),
-          ),
-          const SizedBox(height: 8),
-          Row(
-            children: [
-              Expanded(
-                child: _buildActionButton(
-                  label: 'Scan Agora',
-                  icon: Icons.search_rounded,
-                  color: _kGreen,
-                  loading: _loadingGmail,
-                  onPressed: _scanGmail,
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: _buildActionButton(
-                  label: 'Desligar',
-                  icon: Icons.link_off_rounded,
-                  color: _kRed,
-                  loading: _loadingGmail,
-                  onPressed: _disconnectGmail,
-                ),
-              ),
-            ],
-          ),
-        ],
-      ],
     );
   }
 
@@ -543,7 +432,6 @@ class _ConnectionsScreenState extends State<ConnectionsScreen>
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        // ── Estatísticas ──────────────────────────────────────────
         if (_extStats.totalChecks > 0) ...[
           _buildSectionLabel('Estatísticas da Extensão'),
           const SizedBox(height: 8),
@@ -564,8 +452,6 @@ class _ConnectionsScreenState extends State<ConnectionsScreen>
           ),
           const SizedBox(height: 16),
         ],
-
-        // ── APIs configuradas ─────────────────────────────────────
         _buildSectionLabel('APIs de Análise'),
         const SizedBox(height: 8),
         _buildApiProgressBar(),
@@ -577,37 +463,27 @@ class _ConnectionsScreenState extends State<ConnectionsScreen>
         const SizedBox(height: 8),
         ..._extStatus.apisStatus.entries
             .map((e) => _buildApiRow(e.key, e.value)),
-
         const SizedBox(height: 16),
-
-        // ── Instalar extensão ─────────────────────────────────────
         _buildSectionLabel('Instalar a Extensão'),
         const SizedBox(height: 8),
         _buildInstallCard(),
-
         const SizedBox(height: 16),
-
-        // ── URL do servidor ───────────────────────────────────────
         _buildSectionLabel('URL do Servidor (copiar para a extensão)'),
         const SizedBox(height: 8),
         _buildUrlCopyCard(),
-
         const SizedBox(height: 16),
-
-        // ── Passos de configuração ────────────────────────────────
         _buildSectionLabel('Como Configurar'),
         const SizedBox(height: 8),
         _buildSetupSteps(),
-
         const SizedBox(height: 16),
-
-        // ── Teste de URL ──────────────────────────────────────────
         _buildSectionLabel('Testar URL Manualmente'),
         const SizedBox(height: 8),
         _buildUrlTestCard(),
       ],
     );
   }
+
+  // ── Widgets auxiliares da secção Chrome (mantidos) ──────────────
 
   Widget _buildApiProgressBar() {
     final pct = _extStatus.apiCoverage;
@@ -726,7 +602,6 @@ class _ConnectionsScreenState extends State<ConnectionsScreen>
 
   Widget _buildSetupSteps() {
     final steps = _extensionSvc.getSetupInstructions(_extStatus);
-
     return Column(
       children: steps.asMap().entries.map((entry) {
         final i = entry.key;
@@ -947,7 +822,7 @@ class _ConnectionsScreenState extends State<ConnectionsScreen>
     );
   }
 
-  // ── Componentes reutilizáveis ─────────────────────────────────────
+  // ── Componentes reutilizáveis (agora todos presentes) ──────────
 
   Widget _buildCard({
     required Widget header,

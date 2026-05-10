@@ -51,9 +51,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   String get _greeting {
     final h = DateTime.now().hour;
-    if (h < 12) return 'Good Morning';
-    if (h < 18) return 'Good Afternoon';
-    return 'Good Evening';
+    if (h < 12) return 'Bom dia';
+    if (h < 18) return 'Boa tarde';
+    return 'Boa noite';
   }
 
   Color get _scoreColor {
@@ -71,39 +71,47 @@ class _DashboardScreenState extends State<DashboardScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFF8F9FB),
+      backgroundColor: const Color(0xFFF0F4F8),
       appBar: AppBar(
         backgroundColor: Colors.white,
         elevation: 0,
+        surfaceTintColor: Colors.transparent,
         leading: const Padding(
           padding: EdgeInsets.only(left: 4),
-          child: Icon(Icons.menu, color: Color(0xFF1A1A2E)),
+          child: Icon(Icons.menu_rounded, color: Color(0xFF0F172A)),
         ),
         title: Text.rich(
           TextSpan(children: [
             const TextSpan(
               text: 'Phish',
               style: TextStyle(
-                fontWeight: FontWeight.w800,
-                color: Color(0xFF1A1A2E),
+                fontWeight: FontWeight.w900,
+                color: Color(0xFF0F172A),
                 fontSize: 20,
-                letterSpacing: -0.5,
+                letterSpacing: -0.8,
               ),
             ),
             TextSpan(
               text: 'Guard',
               style: TextStyle(
                 color: AppColors.primary,
-                fontWeight: FontWeight.w800,
+                fontWeight: FontWeight.w900,
                 fontSize: 20,
-                letterSpacing: -0.5,
+                letterSpacing: -0.8,
               ),
             ),
           ]),
         ),
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(1),
+          child: Container(
+            height: 1,
+            color: const Color(0xFFE8EDF2),
+          ),
+        ),
         actions: [
           IconButton(
-            icon: const Icon(Icons.link_rounded, color: Color(0xFF1A1A2E)),
+            icon: const Icon(Icons.link_rounded, color: Color(0xFF0F172A)),
             tooltip: 'Conexões',
             onPressed: () => Navigator.push(
               context,
@@ -115,8 +123,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
             children: [
               const Padding(
                 padding: EdgeInsets.only(right: 12),
-                child: Icon(Icons.notifications_outlined,
-                    color: Color(0xFF1A1A2E)),
+                child: Icon(Icons.notifications_rounded,
+                    color: Color(0xFF0F172A), size: 22),
               ),
               Positioned(
                 top: 10,
@@ -124,9 +132,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 child: Container(
                   width: 8,
                   height: 8,
-                  decoration: const BoxDecoration(
+                  decoration: BoxDecoration(
                     color: AppColors.danger,
                     shape: BoxShape.circle,
+                    border: Border.all(color: Colors.white, width: 1.5),
                   ),
                 ),
               ),
@@ -140,32 +149,60 @@ class _DashboardScreenState extends State<DashboardScreen> {
         child: _loading
             ? const Center(child: CircularProgressIndicator())
             : ListView(
-                padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+                padding: EdgeInsets.zero,
                 children: [
                   if (_error != null) _errorCard(),
-                  _greetingSection(),
-                  const SizedBox(height: 16),
-                  _scoreCard(),
-                  const SizedBox(height: 16),
-                  _ctaCard(),
-                  const SizedBox(height: 24),
-                  const Text(
-                    'Protection Modules',
-                    style: TextStyle(
-                      fontWeight: FontWeight.w700,
-                      fontSize: 16,
-                      color: Color(0xFF1A1A2E),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 20, 16, 0),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        _statsRow(),
+                        const SizedBox(height: 20),
+                        _scoreCard(),
+                        const SizedBox(height: 20),
+                        _ctaCard(),
+                        const SizedBox(height: 24),
+                        Row(
+                          children: [
+                            Container(
+                              width: 3,
+                              height: 16,
+                              decoration: BoxDecoration(
+                                color: AppColors.primary,
+                                borderRadius: BorderRadius.circular(2),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            const Text(
+                              'Módulos de Proteção',
+                              style: TextStyle(
+                                fontWeight: FontWeight.w800,
+                                fontSize: 15,
+                                color: Color(0xFF0F172A),
+                                letterSpacing: -0.3,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        _moduleCard(
+                          Icons.mail_rounded,
+                          'Segurança de E-mail',
+                          'Monitoramento do Gmail ativo',
+                          const Color(0xFF7C3AED),
+                        ),
+                        const SizedBox(height: 10),
+                        _moduleCard(
+                          Icons.language_rounded,
+                          'Proteção Web',
+                          'Extensão do navegador ativa',
+                          const Color(0xFF0891B2),
+                        ),
+                        const SizedBox(height: 24),
+                      ],
                     ),
                   ),
-                  const SizedBox(height: 12),
-                  _moduleCard(Icons.sms_rounded, 'SMS Protection',
-                      'Scanning incoming messages', Colors.blue),
-                  const SizedBox(height: 8),
-                  _moduleCard(Icons.mail_rounded, 'Email Security',
-                      'Gmail monitoring active', Colors.purple),
-                  const SizedBox(height: 8),
-                  _moduleCard(Icons.language_rounded, 'Web Protection',
-                      'Browser extension active', Colors.teal),
                 ],
               ),
       ),
@@ -173,68 +210,170 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 
-  Widget _errorCard() => Container(
-        margin: const EdgeInsets.only(bottom: 12),
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          color: AppColors.danger.withOpacity(0.08),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: AppColors.danger.withOpacity(0.3)),
-        ),
-        child: Row(children: [
-          Icon(Icons.error_outline, color: AppColors.danger, size: 18),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text('Erro: $_error',
-                style: TextStyle(color: AppColors.danger, fontSize: 13)),
+  Widget _heroHeader() => Container(
+        width: double.infinity,
+        decoration: const BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.only(
+            bottomLeft: Radius.circular(28),
+            bottomRight: Radius.circular(28),
           ),
-        ]),
+        ),
+        padding: const EdgeInsets.fromLTRB(20, 20, 20, 24),
+        child: Row(
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '$_greeting 👋',
+                    style: const TextStyle(
+                      fontSize: 13,
+                      color: Color(0xFF64748B),
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  const Text(
+                    'You are Protected',
+                    style: TextStyle(
+                      color: Color(0xFF0F172A),
+                      fontSize: 24,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: -0.8,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Row(
+                    children: [
+                      Container(
+                        width: 7,
+                        height: 7,
+                        decoration: BoxDecoration(
+                          color: AppColors.success,
+                          shape: BoxShape.circle,
+                          boxShadow: [
+                            BoxShadow(
+                              color: AppColors.success.withOpacity(0.5),
+                              blurRadius: 5,
+                              spreadRadius: 1,
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      const Text(
+                        'All systems active & monitoring',
+                        style: TextStyle(
+                          color: Color(0xFF64748B),
+                          fontSize: 12,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            Container(
+              width: 54,
+              height: 54,
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [
+                    AppColors.success.withOpacity(0.15),
+                    AppColors.success.withOpacity(0.05),
+                  ],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                shape: BoxShape.circle,
+                border: Border.all(
+                  color: AppColors.success.withOpacity(0.25),
+                  width: 1.5,
+                ),
+              ),
+              child: Icon(Icons.shield_rounded,
+                  color: AppColors.success, size: 26),
+            ),
+          ],
+        ),
       );
 
-  Widget _greetingSection() => Row(
+  Widget _statsRow() => Row(
         children: [
           Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  '$_greeting 👋',
-                  style: const TextStyle(
-                    fontSize: 14,
-                    color: Color(0xFF6B7280),
-                  ),
-                ),
-                const SizedBox(height: 4),
-                const Text(
-                  'You are Protected',
-                  style: TextStyle(
-                    color: AppColors.success,
-                    fontSize: 22,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: -0.5,
-                  ),
-                ),
-                const SizedBox(height: 2),
-                const Text(
-                  'All systems are active and monitoring',
-                  style: TextStyle(color: Color(0xFF9CA3AF), fontSize: 12),
-                ),
-              ],
+            child: _miniStatCard(
+              '${_stats?.totalAnalyses ?? 0}',
+              'Analisados',
+              Icons.search_rounded,
+              const Color(0xFF2563EB),
             ),
           ),
-          Container(
-            width: 52,
-            height: 52,
-            decoration: BoxDecoration(
-              color: AppColors.success.withOpacity(0.12),
-              shape: BoxShape.circle,
-              border: Border.all(
-                  color: AppColors.success.withOpacity(0.3), width: 2),
+          const SizedBox(width: 10),
+          Expanded(
+            child: _miniStatCard(
+              '${_stats?.totalUnsafe ?? 0}',
+              'Ameaças',
+              Icons.block_rounded,
+              AppColors.danger,
             ),
-            child: const Icon(Icons.shield_rounded,
-                color: AppColors.success, size: 26),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: _miniStatCard(
+              '${(100 - (_stats?.unsafeRatePercent ?? 0)).toInt()}%',
+              'Taxa Segura',
+              Icons.verified_user_rounded,
+              AppColors.success,
+            ),
           ),
         ],
+      );
+
+  Widget _miniStatCard(
+          String value, String label, IconData icon, Color color) =>
+      Container(
+        padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 12),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(16),
+          boxShadow: [
+            BoxShadow(
+              color: color.withOpacity(0.08),
+              blurRadius: 10,
+              offset: const Offset(0, 3),
+            ),
+          ],
+          border: Border(
+            top: BorderSide(color: color, width: 2.5),
+          ),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: color, size: 18),
+            const SizedBox(height: 8),
+            Text(
+              value,
+              style: const TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.w900,
+                color: Color(0xFF0F172A),
+                letterSpacing: -0.5,
+              ),
+            ),
+            Text(
+              label,
+              style: const TextStyle(
+                fontSize: 11,
+                color: Color(0xFF94A3B8),
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ],
+        ),
       );
 
   Widget _scoreCard() => Container(
@@ -243,121 +382,115 @@ class _DashboardScreenState extends State<DashboardScreen> {
           borderRadius: BorderRadius.circular(20),
           boxShadow: [
             BoxShadow(
-              color: Colors.black.withOpacity(0.05),
-              blurRadius: 15,
+              color: Colors.black.withOpacity(0.04),
+              blurRadius: 12,
               offset: const Offset(0, 4),
             ),
           ],
         ),
-        child: Padding(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  const Text(
-                    'Security Score',
-                    style: TextStyle(
-                      fontWeight: FontWeight.w700,
-                      fontSize: 16,
-                      color: Color(0xFF1A1A2E),
-                    ),
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Text(
+                  'Pontuação de Segurança',
+                  style: TextStyle(
+                    fontWeight: FontWeight.w800,
+                    fontSize: 15,
+                    color: Color(0xFF0F172A),
+                    letterSpacing: -0.3,
                   ),
-                  const Spacer(),
-                  Container(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                    decoration: BoxDecoration(
-                      color: _scoreColor.withOpacity(0.12),
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: Text(
-                      _scoreLabel,
-                      style: TextStyle(
-                        color: _scoreColor,
-                        fontWeight: FontWeight.w600,
-                        fontSize: 12,
+                ),
+                const Spacer(),
+              ],
+            ),
+            const SizedBox(height: 20),
+            Row(
+              children: [
+                CircularPercentIndicator(
+                  radius: 62,
+                  lineWidth: 8,
+                  percent: _score / 100,
+                  center: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Text(
+                        '$_score',
+                        style: const TextStyle(
+                          fontSize: 30,
+                          fontWeight: FontWeight.w900,
+                          color: Color(0xFF0F172A),
+                          letterSpacing: -1.5,
+                        ),
                       ),
-                    ),
+                      const Text(
+                        '/100',
+                        style: TextStyle(
+                          fontSize: 10,
+                          color: Color(0xFF94A3B8),
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
                   ),
-                ],
-              ),
-              const SizedBox(height: 20),
-              Row(
-                children: [
-                  CircularPercentIndicator(
-                    radius: 62,
-                    lineWidth: 9,
-                    percent: _score / 100,
-                    center: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Text(
-                          '$_score',
-                          style: const TextStyle(
-                            fontSize: 28,
-                            fontWeight: FontWeight.w800,
-                            color: Color(0xFF1A1A2E),
-                            letterSpacing: -1,
-                          ),
-                        ),
-                        const Text(
-                          '/100',
-                          style: TextStyle(
-                            fontSize: 10,
-                            color: Color(0xFF9CA3AF),
-                          ),
-                        ),
-                      ],
-                    ),
-                    progressColor: _scoreColor,
-                    backgroundColor: const Color(0xFFF0F0F0),
-                    circularStrokeCap: CircularStrokeCap.round,
+                  progressColor: _scoreColor,
+                  backgroundColor: const Color(0xFFF1F5F9),
+                  circularStrokeCap: CircularStrokeCap.round,
+                ),
+                const SizedBox(width: 24),
+                Expanded(
+                  child: Column(
+                    children: [
+                      _statRow(
+                        Icons.search_rounded,
+                        'Analisados',
+                        '${_stats?.totalAnalyses ?? 0}',
+                        const Color(0xFF2563EB),
+                      ),
+                      const SizedBox(height: 14),
+                      _divider(),
+                      const SizedBox(height: 14),
+                      _statRow(
+                        Icons.block_rounded,
+                        'Ameaças',
+                        '${_stats?.totalUnsafe ?? 0}',
+                        AppColors.danger,
+                      ),
+                      const SizedBox(height: 14),
+                      _divider(),
+                      const SizedBox(height: 14),
+                      _statRow(
+                        Icons.verified_user_rounded,
+                        'Proteção',
+                        '${(100 - (_stats?.unsafeRatePercent ?? 0)).toInt()}%',
+                        AppColors.success,
+                      ),
+                    ],
                   ),
-                  const SizedBox(width: 24),
-                  Expanded(
-                    child: Column(
-                      children: [
-                        _statRow(
-                          Icons.search_rounded,
-                          'Scanned',
-                          '${_stats?.totalAnalyses ?? 0}',
-                          const Color(0xFF6366F1),
-                        ),
-                        const SizedBox(height: 12),
-                        _statRow(
-                          Icons.block_rounded,
-                          'Threats',
-                          '${_stats?.totalUnsafe ?? 0}',
-                          AppColors.danger,
-                        ),
-                        const SizedBox(height: 12),
-                        _statRow(
-                          Icons.verified_user_rounded,
-                          'Protection',
-                          '${(100 - (_stats?.unsafeRatePercent ?? 0)).toInt()}%',
-                          AppColors.success,
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ),
+                ),
+              ],
+            ),
+          ],
         ),
+      );
+
+  Widget _divider() => const Divider(
+        height: 1,
+        thickness: 1,
+        color: Color(0xFFF1F5F9),
       );
 
   Widget _statRow(IconData icon, String label, String value, Color color) =>
       Row(
         children: [
           Container(
-            width: 32,
-            height: 32,
+            width: 34,
+            height: 34,
             decoration: BoxDecoration(
-              color: color.withOpacity(0.1),
-              borderRadius: BorderRadius.circular(8),
+              color: color.withOpacity(0.08),
+              borderRadius: BorderRadius.circular(10),
             ),
             child: Icon(icon, color: color, size: 16),
           ),
@@ -369,16 +502,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 Text(
                   value,
                   style: const TextStyle(
-                    fontWeight: FontWeight.w700,
+                    fontWeight: FontWeight.w800,
                     fontSize: 15,
-                    color: Color(0xFF1A1A2E),
+                    color: Color(0xFF0F172A),
+                    letterSpacing: -0.3,
                   ),
                 ),
                 Text(
                   label,
                   style: const TextStyle(
-                    color: Color(0xFF9CA3AF),
+                    color: Color(0xFF94A3B8),
                     fontSize: 11,
+                    fontWeight: FontWeight.w500,
                   ),
                 ),
               ],
@@ -399,24 +534,24 @@ class _DashboardScreenState extends State<DashboardScreen> {
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
             ),
-            borderRadius: BorderRadius.circular(18),
+            borderRadius: BorderRadius.circular(20),
             boxShadow: [
               BoxShadow(
-                color: AppColors.primary.withOpacity(0.35),
-                blurRadius: 16,
-                offset: const Offset(0, 6),
+                color: AppColors.primary.withOpacity(0.30),
+                blurRadius: 20,
+                offset: const Offset(0, 8),
               ),
             ],
           ),
-          padding: const EdgeInsets.all(18),
+          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 16),
           child: Row(
             children: [
               Container(
-                width: 44,
-                height: 44,
+                width: 46,
+                height: 46,
                 decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.2),
-                  borderRadius: BorderRadius.circular(12),
+                  color: Colors.white.withOpacity(0.15),
+                  borderRadius: BorderRadius.circular(14),
                 ),
                 child: const Icon(Icons.link_rounded,
                     color: Colors.white, size: 22),
@@ -427,30 +562,35 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      'Connect Gmail, SMS & Extension',
+                      'Conectar Gmail & Extensão',
                       style: TextStyle(
                         color: Colors.white,
-                        fontWeight: FontWeight.w700,
+                        fontWeight: FontWeight.w800,
                         fontSize: 14,
+                        letterSpacing: -0.2,
                       ),
                     ),
-                    SizedBox(height: 2),
+                    SizedBox(height: 3),
                     Text(
-                      'Enable full monitoring across all channels',
-                      style: TextStyle(color: Colors.white70, fontSize: 12),
+                      'Ativar monitoramento completo em todos os canais',
+                      style: TextStyle(
+                        color: Colors.white60,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w400,
+                      ),
                     ),
                   ],
                 ),
               ),
               Container(
-                width: 32,
-                height: 32,
+                width: 30,
+                height: 30,
                 decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.2),
+                  color: Colors.white.withOpacity(0.15),
                   shape: BoxShape.circle,
                 ),
-                child: const Icon(Icons.chevron_right,
-                    color: Colors.white, size: 20),
+                child: const Icon(Icons.arrow_forward_rounded,
+                    color: Colors.white, size: 16),
               ),
             ],
           ),
@@ -462,68 +602,136 @@ class _DashboardScreenState extends State<DashboardScreen> {
       Container(
         decoration: BoxDecoration(
           color: Colors.white,
-          borderRadius: BorderRadius.circular(14),
+          borderRadius: BorderRadius.circular(16),
           boxShadow: [
             BoxShadow(
               color: Colors.black.withOpacity(0.04),
-              blurRadius: 8,
-              offset: const Offset(0, 2),
+              blurRadius: 10,
+              offset: const Offset(0, 3),
             ),
           ],
         ),
-        child: ListTile(
-          contentPadding:
-              const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-          leading: Container(
-            width: 44,
-            height: 44,
-            decoration: BoxDecoration(
-              color: color.withOpacity(0.1),
-              borderRadius: BorderRadius.circular(12),
+        child: Row(
+          children: [
+            Container(
+              width: 4,
+              height: 70,
+              decoration: BoxDecoration(
+                color: color,
+                borderRadius: const BorderRadius.only(
+                  topLeft: Radius.circular(16),
+                  bottomLeft: Radius.circular(16),
+                ),
+              ),
             ),
-            child: Icon(icon, color: color, size: 22),
-          ),
-          title: Text(
-            name,
-            style: const TextStyle(
-              fontWeight: FontWeight.w600,
-              fontSize: 14,
-              color: Color(0xFF1A1A2E),
+            const SizedBox(width: 14),
+            Container(
+              width: 40,
+              height: 40,
+              decoration: BoxDecoration(
+                color: color.withOpacity(0.08),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Icon(icon, color: color, size: 20),
             ),
-          ),
-          subtitle: Text(
-            description,
-            style: const TextStyle(color: Color(0xFF9CA3AF), fontSize: 12),
-          ),
-          trailing: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-            decoration: BoxDecoration(
-              color: AppColors.success.withOpacity(0.1),
-              borderRadius: BorderRadius.circular(20),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 15),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      name,
+                      style: const TextStyle(
+                        fontWeight: FontWeight.w700,
+                        fontSize: 14,
+                        color: Color(0xFF0F172A),
+                        letterSpacing: -0.2,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      description,
+                      style: const TextStyle(
+                        color: Color(0xFF94A3B8),
+                        fontSize: 12,
+                        fontWeight: FontWeight.w400,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Container(
-                  width: 6,
-                  height: 6,
-                  decoration: const BoxDecoration(
-                    color: AppColors.success,
-                    shape: BoxShape.circle,
+            Padding(
+              padding: const EdgeInsets.only(right: 16),
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+                decoration: BoxDecoration(
+                  color: AppColors.success.withOpacity(0.08),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(
+                    color: AppColors.success.withOpacity(0.2),
+                    width: 1,
                   ),
                 ),
-                const SizedBox(width: 5),
-                const Text(
-                  'Active',
-                  style: TextStyle(
-                    color: AppColors.success,
-                    fontSize: 11,
-                    fontWeight: FontWeight.w600,
-                  ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 5,
+                      height: 5,
+                      decoration: BoxDecoration(
+                        color: AppColors.success,
+                        shape: BoxShape.circle,
+                        boxShadow: [
+                          BoxShadow(
+                            color: AppColors.success.withOpacity(0.6),
+                            blurRadius: 4,
+                            spreadRadius: 1,
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 5),
+                    const Text(
+                      'Ativo',
+                      style: TextStyle(
+                        color: AppColors.success,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
                 ),
-              ],
+              ),
             ),
-          ),
+          ],
         ),
+      );
+
+  Widget _errorCard() => Container(
+        margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        decoration: BoxDecoration(
+          color: AppColors.danger.withOpacity(0.06),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: AppColors.danger.withOpacity(0.2)),
+        ),
+        child: Row(children: [
+          Icon(Icons.error_outline_rounded, color: AppColors.danger, size: 18),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'Erro: $_error',
+              style: TextStyle(
+                color: AppColors.danger,
+                fontSize: 13,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+        ]),
       );
 }

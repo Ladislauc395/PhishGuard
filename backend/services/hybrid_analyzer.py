@@ -1,83 +1,46 @@
 """
 backend/services/hybrid_analyzer.py
 ─────────────────────────────────────────────────────────────────────────────
-MOTOR DE ANÁLISE HÍBRIDA v11 — PhishGuard
+MOTOR DE ANÁLISE HÍBRIDA v17 — PhishGuard
 
-Combina TODAS as camadas de detecção num pipeline resiliente:
-
-  CAMADA 1 — Local/Offline (sempre disponível, <50ms):
-    ├── Heurísticas PT/Angola (keywords, urgência, credenciais)
-    ├── Análise estrutural de URLs (TLD, hifens, IP, @, encurtadores)
-    ├── Display-name spoofing
-    ├── Typosquatting (Levenshtein)
-    └── Regras YARA (padrões de phishing compilados)
-
-  CAMADA 2 — NLP/NER (spaCy, ~100ms):
-    ├── Named Entity Recognition — detecta marcas/organizações no texto
-    ├── BeautifulSoup — extrai texto limpo de HTML
-    └── Score de conflito: entidade reconhecida ≠ domínio remetente
-
-  CAMADA 3 — ML (Groq LLM, timeout 12s):
-    ├── Análise semântica do texto completo
-    └── Fallback para heurísticas se Groq indisponível
-
-  CAMADA 4 — DNS/Auth (timeout 5s):
-    ├── SPF, DKIM, DMARC
-    └── Resolução DNS do remetente
-
-  CAMADA 5 — APIs Externas em PARALELO (timeout 10s, apenas se score > 15):
-    ├── VirusTotal (análise de URL)
-    ├── Google Safe Browsing
-    ├── URLScan.io (verificar resultado existente)
-    ├── AbuseIPDB (IP do remetente)
-    └── DNSBL (Spamhaus / SURBL / URIBL)
-
-LÓGICA DE CONSENSO:
-  - Score < 15 → retorna SEGURO imediatamente (sem APIs externas)
-  - APIs externas: ≥2 positivas → score mínimo 80
-  - Fallback em cascata: se camada N falhar → continuar com camada N-1
-  - Timeout por camada → score parcial mantém-se, motivo registado
-
-CORRECÇÕES v11:
-  - Timeout por email: 60s com fallback parcial (não retorna SEGURO por timeout)
-  - Emails de ESPs legítimos (Twilio, SendGrid, etc.) → score máx 25 se ML OK
-  - YARA: regras integradas sem ficheiro externo (compiladas em memória)
-  - NER: detecta conflito marca/domínio com spaCy pt_core_news_sm (fallback regex)
-  - BeautifulSoup: extrai texto de HTML antes de passar ao ML e heurísticas
-  - unblock_email: corrigido para remover label sem erro 500
+CORRECÇÕES v17:
+- Extração de URLs melhorada (assunto + corpo) com regex e fallback.
+- APIs externas (VirusTotal, Google Safe Browsing, PhishTank, URLScan)
+  agora são chamadas sempre que um URL é encontrado, mesmo que seja no assunto.
+- Sem timeout global – cada API tem o seu próprio timeout.
+- Logs detalhados para diagnóstico.
 """
 
 from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import logging
 import re
 import socket
 import time
+import unicodedata
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlparse
-
-import httpx
 
 logger = logging.getLogger(__name__)
 
 # ─── Importações opcionais com fallback gracioso ──────────────────
-
 try:
     import yara
     _HAS_YARA = True
 except ImportError:
     _HAS_YARA = False
-    logger.warning("yara-python não instalado — camada YARA desactivada")
+    logger.warning("yara-python não instalado – camada YARA desactivada")
 
 try:
     from bs4 import BeautifulSoup
     _HAS_BS4 = True
 except ImportError:
     _HAS_BS4 = False
-    logger.warning("beautifulsoup4 não instalado — extracção HTML desactivada")
+    logger.warning("beautifulsoup4 não instalado – extracção HTML desactivada")
 
 try:
     import spacy
@@ -91,16 +54,14 @@ try:
         except OSError:
             _HAS_SPACY = False
             _nlp = None
-            logger.warning("Modelos spaCy não encontrados — NER desactivado")
+            logger.warning("Modelos spaCy não encontrados – NER desactivado")
 except ImportError:
     _HAS_SPACY = False
     _nlp = None
-    logger.warning("spaCy não instalado — NER desactivado")
+    logger.warning("spaCy não instalado – NER desactivado")
 
 
 # ─── YARA Rules (compiladas em memória) ───────────────────────────
-# Regras que cobrem padrões de phishing universais e Angola-específicos.
-# Não requerem ficheiro externo.
 
 _YARA_SOURCE = r"""
 rule PhishingPortuguese {
@@ -129,10 +90,8 @@ rule PhishingPortuguese {
         $urgent4 = "ultimo aviso" nocase ascii wide
         $urgent5 = "24 horas" nocase ascii wide
     condition:
-        2 of ($cred*) or
-        (1 of ($cred*) and 1 of ($urgent*))
+        2 of ($cred*) or (1 of ($cred*) and 1 of ($urgent*))
 }
-
 rule PhishingAngola {
     meta:
         description = "Phishing com contexto angolano"
@@ -153,10 +112,8 @@ rule PhishingAngola {
         $pin2    = "codigo pin" nocase ascii wide
         $pin3    = "seu pin" nocase ascii wide
     condition:
-        (1 of ($brand*) and 1 of ($action*)) or
-        (1 of ($brand*) and 1 of ($pin*))
+        (1 of ($brand*) and 1 of ($action*)) or (1 of ($brand*) and 1 of ($pin*))
 }
-
 rule PhishingURLPatterns {
     meta:
         description = "URLs com padrões de phishing"
@@ -171,10 +128,8 @@ rule PhishingURLPatterns {
         $url7 = /https?:\/\/[^\s]*-verify-[^\s]*/
         $url8 = /https?:\/\/[^\s]*-update-[^\s]*/
         $url9 = /https?:\/\/[^\s]*-banking-[^\s]*/
-    condition:
-        any of them
+    condition: any of them
 }
-
 rule CredentialHarvesting {
     meta:
         description = "Pedido de credenciais + link"
@@ -189,8 +144,7 @@ rule CredentialHarvesting {
         $cred7 = "numero do cartao" nocase
         $link  = /https?:\/\//
         $urgent = /(urgente|imediato|24 horas|bloqueado|suspens)/i
-    condition:
-        $link and $urgent and 1 of ($cred*)
+    condition: $link and $urgent and 1 of ($cred*)
 }
 """
 
@@ -198,60 +152,54 @@ _yara_rules = None
 if _HAS_YARA:
     try:
         _yara_rules = yara.compile(source=_YARA_SOURCE)
-        logger.info("YARA: %d regras compiladas com sucesso", 4)
+        logger.info("YARA: regras compiladas com sucesso")
     except Exception as e:
         logger.warning("YARA: falha ao compilar regras: %s", e)
         _HAS_YARA = False
 
-
 # ─── Marcas conhecidas para NER ───────────────────────────────────
 
 _BRAND_NER_MAP: dict[str, list[str]] = {
-    "BAI":              ["bai.ao", "baionline.ao"],
-    "BFA":              ["bfa.ao", "bfaonline.ao"],
-    "BIC":              ["bic.ao", "bicnet.ao"],
-    "BPC":              ["bpc.ao"],
-    "Atlântico":        ["atlantico.ao"],
-    "Standard Bank":    ["standardbank.ao"],
-    "Unitel":           ["unitel.ao"],
-    "Movicel":          ["movicel.ao"],
-    "Africell":         ["africell.ao"],
-    "Multicaixa":       ["multicaixa.ao", "emis.ao"],
-    "EMIS":             ["emis.ao"],
-    "Sonangol":         ["sonangol.ao"],
-    "TAAG":             ["taag.ao"],
-    "Google":           ["google.com", "accounts.google.com", "notifications.google.com"],
-    "Microsoft":        ["microsoft.com", "office.com", "outlook.com"],
-    "PayPal":           ["paypal.com", "paypal.me"],
-    "Apple":            ["apple.com", "icloud.com"],
-    "Amazon":           ["amazon.com", "aws.amazon.com"],
-    "Netflix":          ["netflix.com"],
-    "DHL":              ["dhl.com", "dhl.de"],
-    "FedEx":            ["fedex.com"],
-    "LinkedIn":         ["linkedin.com"],
-    "Facebook":         ["facebook.com", "facebookmail.com"],
-    "Twilio":           ["twilio.com", "team.twilio.com", "sendgrid.net"],
-    "SendGrid":         ["sendgrid.net", "sendgrid.com"],
-    "Stripe":           ["stripe.com"],
-    "GitHub":           ["github.com", "mg.github.com"],
+    "BAI": ["bai.ao", "baionline.ao"],
+    "BFA": ["bfa.ao", "bfaonline.ao"],
+    "BIC": ["bic.ao", "bicnet.ao"],
+    "BPC": ["bpc.ao"],
+    "Atlântico": ["atlantico.ao"],
+    "Standard Bank": ["standardbank.ao"],
+    "Unitel": ["unitel.ao"],
+    "Movicel": ["movicel.ao"],
+    "Africell": ["africell.ao"],
+    "Multicaixa": ["multicaixa.ao", "emis.ao"],
+    "EMIS": ["emis.ao"],
+    "Sonangol": ["sonangol.ao"],
+    "TAAG": ["taag.ao"],
+    "Google": ["google.com", "accounts.google.com", "notifications.google.com"],
+    "Microsoft": ["microsoft.com", "office.com", "outlook.com"],
+    "PayPal": ["paypal.com", "paypal.me"],
+    "Apple": ["apple.com", "icloud.com"],
+    "Amazon": ["amazon.com", "aws.amazon.com"],
+    "Netflix": ["netflix.com"],
+    "DHL": ["dhl.com", "dhl.de"],
+    "FedEx": ["fedex.com"],
+    "LinkedIn": ["linkedin.com"],
+    "Facebook": ["facebook.com", "facebookmail.com"],
+    "Twilio": ["twilio.com", "team.twilio.com", "sendgrid.net"],
+    "SendGrid": ["sendgrid.net", "sendgrid.com"],
+    "Stripe": ["stripe.com"],
+    "GitHub": ["github.com", "mg.github.com"],
 }
 
-# Lookup inverso: domínio → brand
 _DOMAIN_TO_BRAND: dict[str, str] = {}
 for _brand, _domains in _BRAND_NER_MAP.items():
     for _d in _domains:
         _DOMAIN_TO_BRAND[_d.lower()] = _brand
 
-# Regex de fallback para NER sem spaCy
 _BRAND_REGEX = re.compile(
     r"\b(" + "|".join(re.escape(b) for b in _BRAND_NER_MAP.keys()) + r")\b",
     re.IGNORECASE,
 )
 
-
-# ─── ESPs e serviços legítimos ────────────────────────────────────
-
-_LEGIT_ESPS: set[str] = {
+_LEGIT_ESPS = {
     "sendgrid.net", "mailchimp.com", "amazonses.com", "mandrillapp.com",
     "sparkpostmail.com", "mailgun.org", "exacttarget.com", "salesforce.com",
     "mailjet.com", "sendinblue.com", "brevo.com", "constantcontact.com",
@@ -261,22 +209,37 @@ _LEGIT_ESPS: set[str] = {
     "netlify.com", "vercel.com", "team.twilio.com",
 }
 
-_KNOWN_SERVICES: set[str] = _LEGIT_ESPS | {
+_KNOWN_SERVICES = _LEGIT_ESPS | {
     "google.com", "accounts.google.com", "notifications.google.com",
     "no-reply.accounts.google.com", "bai.ao", "bfa.ao", "bic.ao", "bpc.ao",
     "unitel.ao", "movicel.ao", "africell.ao", "multicaixa.ao", "emis.ao",
     "sonangol.ao", "taag.ao", "governo.ao", "bna.ao",
 }
 
-_FREE_EMAIL: set[str] = {
-    "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "live.com",
-    "aol.com", "mail.com", "protonmail.com", "icloud.com", "yandex.com",
-}
+# ─── Expressões regulares para URLs ───────────────────────────────
 
-URL_RE = re.compile(r"https?://[^\s<>\"')\]]+", re.IGNORECASE)
+# Padrão mais abrangente para capturar URLs (inclui caracteres especiais)
+URL_RE = re.compile(r"https?://[^\s<>\"')\\]]+", re.IGNORECASE)
+# Fallback: qualquer string que comece com http:// ou https:// e termine com espaço ou fim de linha
+URL_RE_FALLBACK = re.compile(r"https?://\S+")
 
+_PHISHING_KEYWORDS = [
+    r"\bpin\b", r"\bsenha\b", r"\bpassword\b", r"\bcvv\b", r"\biban\b",
+    "codigo de acesso", "numero de conta", "numero do cartao",
+    "dados bancarios", "dados bancários",
+    r"urgent[ei]?", "urgente", "imediato", "último aviso", "ultimo aviso",
+    "24 horas", "48 horas", "conta bloqueada", "acesso suspenso",
+    "suspensão de conta", "suspensao de conta", "senha expirada",
+    "palavra-passe expirada", "atividade suspeita", "login não autorizado",
+    "login nao autorizado", "reativação de conta", "reativacao de conta",
+    "clique aqui", "aceda já", "aceda ja", "acesse agora",
+    "verificar a sua conta", "confirme os seus dados", "valide a sua conta",
+    "multicaixa", "bai directo", "bai net", "bfa net",
+    "conta suspensa", "bloqueio imediato",
+]
+_PHISHING_KW_RE = re.compile("|".join(_PHISHING_KEYWORDS), re.IGNORECASE)
+_ALERT_EMOJI_RE = re.compile(r"[🚨⚠️🔴🔒❗❕‼️🛑🚫]")
 
-# ─── Resultado estruturado ────────────────────────────────────────
 
 @dataclass
 class HybridResult:
@@ -284,7 +247,6 @@ class HybridResult:
     verdict: str = "SEGURO"
     reasons: list[str] = field(default_factory=list)
     layers: dict[str, Any] = field(default_factory=dict)
-    # Campos exportados para compatibilidade com orchestrator
     ml: dict = field(default_factory=dict)
     dns: dict = field(default_factory=dict)
     brand_detected: str | None = None
@@ -297,253 +259,158 @@ class HybridResult:
     ner_brands: list[str] = field(default_factory=list)
     sender: str = ""
     domain: str = ""
+    subject: str = ""
     urls_checked: list[dict] = field(default_factory=list)
 
 
-# ─── CAMADA 1: HTML → Texto limpo ────────────────────────────────
+# ─── Funções auxiliares ───────────────────────────────────────────
+
+def analyze_keywords(subject: str, body: str) -> tuple[int, list[str]]:
+    score = 0
+    reasons = []
+    if subject:
+        matches = _PHISHING_KW_RE.findall(subject)
+        if matches:
+            unique = list(dict.fromkeys(m.lower() for m in matches))
+            score += min(35, len(unique) * 12)
+            reasons.append(f"Palavras-chave suspeitas no assunto: {', '.join(unique[:5])}")
+        if _ALERT_EMOJI_RE.findall(subject):
+            score += 10
+            reasons.append("Emojis de urgência no assunto")
+        caps = [w for w in subject.split() if len(w) >= 4 and w.isupper()]
+        if len(caps) >= 2:
+            score += 10
+            reasons.append("Assunto com palavras em maiúsculas (urgência artificial)")
+    if body:
+        matches = _PHISHING_KW_RE.findall(body)
+        if matches:
+            unique = list(dict.fromkeys(m.lower() for m in matches))
+            score += min(25, len(unique) * 5)
+            reasons.append(f"Palavras-chave suspeitas no corpo: {', '.join(unique[:5])}")
+    return min(score, 55), reasons
+
 
 def extract_text_from_html(raw: str) -> str:
-    """Extrai texto limpo de HTML com BeautifulSoup. Fallback para regex."""
     if not raw:
         return ""
     if not _HAS_BS4:
-        # Fallback: remover tags HTML com regex
-        clean = re.sub(r"<[^>]+>", " ", raw)
-        clean = re.sub(r"&[a-z]+;", " ", clean)
-        return re.sub(r"\s+", " ", clean).strip()
+        return re.sub(r"<[^>]+>", " ", raw).strip()
     try:
         soup = BeautifulSoup(raw, "lxml")
-        # Remover script/style
         for tag in soup(["script", "style", "meta", "link"]):
             tag.decompose()
-        text = soup.get_text(separator=" ", strip=True)
-        return re.sub(r"\s+", " ", text).strip()
+        return soup.get_text(separator=" ", strip=True)
     except Exception:
         try:
-            soup = BeautifulSoup(raw, "html.parser")
-            return soup.get_text(separator=" ", strip=True)
+            return BeautifulSoup(raw, "html.parser").get_text(separator=" ", strip=True)
         except Exception:
             return raw
 
 
-# ─── CAMADA 2: YARA ───────────────────────────────────────────────
-
 def run_yara(text: str) -> tuple[int, list[str]]:
-    """
-    Aplica regras YARA ao texto.
-    Retorna (score_adicional, regras_matched).
-    """
     if not _HAS_YARA or not _yara_rules or not text:
         return 0, []
-
     score = 0
-    matched_rules: list[str] = []
-
+    matched = []
     try:
-        text_bytes = text.encode("utf-8", errors="replace")[:65535]
-        matches = _yara_rules.match(data=text_bytes)
-
-        severity_scores = {
-            "critical": 45,
-            "high":     30,
-            "medium":   20,
-        }
-
-        for match in matches:
-            rule_name = match.rule
-            severity = match.meta.get("severity", "medium")
-            points = severity_scores.get(severity, 20)
-            score += points
-            matched_rules.append(rule_name)
-            logger.debug("YARA match: %s (severity=%s, +%d pts)", rule_name, severity, points)
-
+        for match in _yara_rules.match(data=text.encode("utf-8", errors="replace")[:65535]):
+            sev = match.meta.get("severity", "medium")
+            pts = {"critical": 45, "high": 30, "medium": 20}.get(sev, 20)
+            score += pts
+            matched.append(match.rule)
     except Exception as e:
         logger.warning("YARA scan falhou: %s", e)
+    return min(score, 80), matched
 
-    return min(score, 80), matched_rules
-
-
-# ─── CAMADA 3: NER (spaCy + fallback regex) ───────────────────────
 
 def run_ner(text: str, sender_domain: str) -> tuple[int, list[str], list[str]]:
-    """
-    Named Entity Recognition para detectar conflito marca ↔ domínio.
-
-    Cenário de phishing clássico:
-      - Email menciona "BAI" ou "Multicaixa" no corpo
-      - Mas é enviado de um domínio completamente diferente
-
-    Retorna (score_ner, marcas_detectadas, razoes).
-    """
     if not text or not sender_domain:
         return 0, [], []
-
-    brands_in_text: list[str] = []
-
-    # spaCy NER
-    if _HAS_SPACY and _nlp is not None:
+    brands = []
+    if _HAS_SPACY and _nlp:
         try:
-            doc = _nlp(text[:5000])  # limitar para performance
-            for ent in doc.ents:
+            for ent in _nlp(text[:5000]).ents:
                 if ent.label_ in ("ORG", "PRODUCT", "BRAND"):
-                    name = ent.text.strip()
-                    # Verificar se é uma das nossas marcas conhecidas
                     for brand in _BRAND_NER_MAP:
-                        if brand.lower() in name.lower():
-                            if brand not in brands_in_text:
-                                brands_in_text.append(brand)
-        except Exception as e:
-            logger.debug("spaCy NER falhou: %s — usando regex", e)
-
-    # Fallback ou complemento: regex de marcas
+                        if brand.lower() in ent.text.lower() and brand not in brands:
+                            brands.append(brand)
+        except Exception:
+            pass
     for m in _BRAND_REGEX.finditer(text[:5000]):
         brand = m.group(0)
-        # Normalizar capitalização
-        for known_brand in _BRAND_NER_MAP:
-            if known_brand.lower() == brand.lower():
-                if known_brand not in brands_in_text:
-                    brands_in_text.append(known_brand)
-
-    if not brands_in_text:
+        for known in _BRAND_NER_MAP:
+            if known.lower() == brand.lower() and known not in brands:
+                brands.append(known)
+    if not brands:
         return 0, [], []
-
-    # Verificar conflito: a marca está no texto mas o remetente não é o domínio oficial?
     score = 0
     reasons = []
-
-    sender_is_legit_for_brand = False
-    for brand in brands_in_text:
-        official_domains = _BRAND_NER_MAP.get(brand, [])
-        for od in official_domains:
-            if od.lower() == sender_domain.lower() or sender_domain.endswith("." + od.lower()):
-                sender_is_legit_for_brand = True
-                break
-            # ESP que é legítimo para essa marca
-            if any(esp in sender_domain for esp in _LEGIT_ESPS):
-                sender_is_legit_for_brand = True
-                break
-        if sender_is_legit_for_brand:
-            break
-
-    if not sender_is_legit_for_brand and brands_in_text:
-        score += 25 * min(len(brands_in_text), 2)
-        brand_list = ", ".join(brands_in_text[:3])
-        reasons.append(
-            f"NER: email menciona marca(s) '{brand_list}' "
-            f"mas remetente é '{sender_domain}' (domínio não oficial)"
-        )
-
-    return min(score, 50), brands_in_text, reasons
+    legit = any(
+        sender_domain == od.lower() or sender_domain.endswith("." + od.lower())
+        for brand in brands
+        for od in _BRAND_NER_MAP.get(brand, [])
+    ) or any(esp in sender_domain for esp in _LEGIT_ESPS)
+    if not legit:
+        score = 25 * min(len(brands), 2)
+        reasons.append(f"NER: email menciona marca(s) '{', '.join(brands[:3])}' mas remetente é '{sender_domain}'")
+    return min(score, 50), brands, reasons
 
 
-# ─── CAMADA 4: Análise estrutural de URL ──────────────────────────
-
-_SUSPICIOUS_TLDS = {
-    ".xyz", ".top", ".click", ".tk", ".ml", ".ga", ".cf", ".gq",
-    ".pw", ".cam", ".icu", ".surf", ".monster", ".live", ".online",
-    ".site", ".website", ".press", ".space", ".fun", ".host",
-    ".shop", ".store", ".vip", ".win", ".bid", ".stream",
-}
-
-_SHORTENERS = {
-    "bit.ly", "tinyurl.com", "goo.gl", "t.co", "is.gd",
-    "ow.ly", "cutt.ly", "rebrand.ly", "rb.gy", "short.link",
-}
-
-_SUSPICIOUS_HOSTING = {
-    "ngrok.io", "ngrok-free.app", "netlify.app", "github.io",
-    "vercel.app", "pages.dev", "glitch.me", "replit.co",
-    "000webhost.com", "weebly.com", "wixsite.com",
-    "firebaseapp.com", "web.app",
-}
+_SUSPICIOUS_TLDS = {".xyz", ".top", ".click", ".tk", ".ml", ".ga", ".cf", ".gq", ".pw", ".cam", ".icu"}
+_SHORTENERS = {"bit.ly", "tinyurl.com", "goo.gl", "t.co", "is.gd", "ow.ly", "cutt.ly", "rebrand.ly", "rb.gy", "short.link"}
+_SUSPICIOUS_HOSTING = {"ngrok.io", "ngrok-free.app", "netlify.app", "github.io", "vercel.app", "pages.dev", "glitch.me", "replit.co", "000webhost.com", "weebly.com", "wixsite.com", "firebaseapp.com", "web.app"}
 
 
 def analyze_url_local(url: str) -> tuple[int, list[str]]:
-    """Análise estrutural de URL sem chamadas de rede."""
     score = 0
-    reasons: list[str] = []
-
+    reasons = []
     try:
-        parsed = urlparse(url)
-        domain = (parsed.hostname or "").lower().lstrip("www.")
-        path = (parsed.path or "").lower()
-        query = (parsed.query or "").lower()
+        p = urlparse(url)
+        d = (p.hostname or "").lower().lstrip("www.")
     except Exception:
         return 0, []
-
-    if not domain:
+    if not d:
         return 0, []
-
-    # IP como hostname → phishing quase certo
     try:
-        ipaddress.ip_address(domain)
-        score += 40
-        reasons.append(f"URL usa endereço IP directamente: {domain}")
-        return min(100, score), reasons
+        ipaddress.ip_address(d)
+        return 40, [f"URL usa endereço IP: {d}"]
     except ValueError:
         pass
-
-    # TLD suspeito
     for tld in _SUSPICIOUS_TLDS:
-        if domain.endswith(tld):
+        if d.endswith(tld):
             score += 25
             reasons.append(f"TLD suspeito: {tld}")
             break
-
-    # Hosting suspeito
     for host in _SUSPICIOUS_HOSTING:
-        if host in domain:
+        if host in d:
             score += 30
-            reasons.append(f"Domínio em serviço de hosting suspeito: {host}")
+            reasons.append(f"Hosting suspeito: {host}")
             break
-
-    # Encurtador
-    if domain in _SHORTENERS:
+    if d in _SHORTENERS:
         score += 20
-        reasons.append(f"Encurtador de URL: {domain}")
-
-    # @ na URL antes do ? (credential harvesting)
-    url_path_part = url.split("?")[0]
-    if "@" in url_path_part:
+        reasons.append(f"Encurtador: {d}")
+    if "@" in url.split("?")[0]:
         score += 40
-        reasons.append("URL contém '@' no caminho (possível credential harvesting)")
-
-    # Muitos hifens no domínio
-    base = domain.split(".")[0]
-    if base.count("-") >= 3:
+        reasons.append("URL contém '@'")
+    if d.split(".")[0].count("-") >= 3:
         score += 20
-        reasons.append(f"Domínio com múltiplos hífens: {domain}")
-
-    # Domínio muito longo
-    if len(domain) > 40:
+        reasons.append("Muitos hífens")
+    if len(d) > 40:
         score += 15
-        reasons.append(f"Domínio anormalmente longo ({len(domain)} chars)")
-
-    # Palavras de phishing no path/query
-    phishing_path_words = [
-        "login", "signin", "account", "verify", "confirm",
-        "secure", "update", "banking", "password", "credential",
-        "validate", "suspend", "recover", "unlock", "wallet",
-    ]
-    path_full = path + " " + query
-    found_words = [w for w in phishing_path_words if w in path_full]
-    if len(found_words) >= 2:
+        reasons.append("Domínio muito longo")
+    path = (p.path or "") + " " + (p.query or "")
+    phishing_words = ["login", "signin", "account", "verify", "confirm", "secure", "update", "banking", "password"]
+    found = [w for w in phishing_words if w in path]
+    if len(found) >= 2:
         score += 20
-        reasons.append(f"Palavras de phishing no URL: {', '.join(found_words[:3])}")
-    elif found_words:
-        score += 8
-
-    # HTTPS não presente (em 2026, sites legítimos usam HTTPS)
+        reasons.append(f"Palavras de phishing no URL: {', '.join(found[:3])}")
     if url.startswith("http://"):
         score += 10
-        reasons.append("URL usa HTTP (não seguro)")
-
+        reasons.append("URL usa HTTP")
     return min(100, score), reasons
 
 
-# ─── CAMADA 5: Typosquatting ──────────────────────────────────────
-
-_BRAND_DOMAINS_TYPO: dict[str, str] = {
+_BRAND_DOMAINS_TYPO = {
     "bai.ao": "BAI", "bfa.ao": "BFA", "bic.ao": "BIC", "bpc.ao": "BPC",
     "atlantico.ao": "Banco Atlântico", "standardbank.ao": "Standard Bank",
     "unitel.ao": "Unitel", "movicel.ao": "Movicel", "africell.ao": "Africell",
@@ -555,9 +422,9 @@ _BRAND_DOMAINS_TYPO: dict[str, str] = {
 }
 
 
-def _levenshtein(s1: str, s2: str) -> int:
+def _lev(s1, s2):
     if len(s1) < len(s2):
-        return _levenshtein(s2, s1)
+        return _lev(s2, s1)
     if not s2:
         return len(s1)
     prev = list(range(len(s2) + 1))
@@ -570,85 +437,92 @@ def _levenshtein(s1: str, s2: str) -> int:
 
 
 def check_typosquatting(domain: str) -> tuple[bool, str, str]:
-    """Detecta typosquatting com Levenshtein."""
     if not domain:
         return False, "", ""
     d = domain.lower().lstrip("www.")
     if d in _BRAND_DOMAINS_TYPO:
         return False, "", ""
     for brand_d, brand_name in _BRAND_DOMAINS_TYPO.items():
-        dist = _levenshtein(d, brand_d)
-        if 0 < dist <= 2:
+        if 0 < _lev(d, brand_d) <= 2:
             return True, brand_name, brand_d
-        brand_base = brand_d.split(".")[0]
-        d_base = d.split(".")[0]
-        if len(brand_base) >= 4 and brand_base in d_base and d_base != brand_base:
+        if brand_d.split(".")[0] in d and d != brand_d and len(brand_d.split(".")[0]) >= 4:
             return True, brand_name, brand_d
     return False, "", ""
 
 
-# ─── CAMADA 6: Display-name spoofing ─────────────────────────────
-
 def check_display_name_spoofing(sender: str) -> tuple[bool, str]:
-    """Detecta quando display name imita uma marca mas o domínio é diferente."""
     if not sender or "@" not in sender or "<" not in sender:
         return False, ""
     try:
-        display = sender[: sender.index("<")].strip().strip('"').lower()
-        email_part = sender[sender.index("<") + 1 :].strip(">").strip()
-        if not display or "@" not in email_part:
-            return False, ""
-        email_domain = email_part.split("@")[-1].lower()
+        display = sender[:sender.index("<")].strip().strip('"').lower()
+        dom = sender[sender.index("<") + 1:].strip(">").strip().split("@")[-1].lower()
     except Exception:
         return False, ""
-
-    # ESPs legítimos → nunca spoofing
-    if any(esp in email_domain for esp in _LEGIT_ESPS):
+    if any(esp in dom for esp in _LEGIT_ESPS):
         return False, ""
-
-    for brand, official_domains in _BRAND_NER_MAP.items():
-        brand_lower = brand.lower()
-        brand_words = brand_lower.split()
-        if any(word in display for word in brand_words if len(word) >= 4):
-            is_official = any(
-                email_domain == od.lower() or email_domain.endswith("." + od.lower())
-                for od in official_domains
-            )
-            if not is_official:
+    for brand, officials in _BRAND_NER_MAP.items():
+        if any(word in display for word in brand.lower().split() if len(word) >= 4):
+            if not any(dom == od.lower() or dom.endswith("." + od.lower()) for od in officials):
                 return True, brand
     return False, ""
 
 
-# ─── Extracção de domínio do remetente ───────────────────────────
+def check_homoglyph_domain(domain: str) -> tuple[bool, str]:
+    if not domain:
+        return False, ""
+    try:
+        ascii_ver = unicodedata.normalize("NFKD", domain).encode("ascii", "ignore").decode("ascii").lower()
+        if ascii_ver != domain.lower():
+            for brand_d, brand_name in _BRAND_DOMAINS_TYPO.items():
+                if _lev(ascii_ver, brand_d) <= 1:
+                    return True, brand_name
+    except Exception:
+        pass
+    return False, ""
+
 
 def extract_sender_domain(sender: str) -> str:
     if not sender:
         return ""
-    # "Name <email@domain.com>" ou "email@domain.com"
     if "<" in sender:
-        match = re.search(r"<[^>]*@([^>]+)>", sender)
-        if match:
-            return match.group(1).strip().lower()
+        m = re.search(r"<[^>]*@([^>]+)>", sender)
+        if m:
+            return m.group(1).strip().lower()
     if "@" in sender:
         return sender.split("@")[-1].strip(">").strip().lower()
     return ""
 
 
 def is_legit_sender(domain: str) -> bool:
-    """True se o domínio do remetente é de um serviço/ESP legítimo conhecido."""
     if not domain:
         return False
     if domain in _KNOWN_SERVICES:
         return True
-    for known in _KNOWN_SERVICES:
-        if domain.endswith("." + known):
-            return True
-    if any(esp in domain for esp in _LEGIT_ESPS):
-        return True
-    return False
+    return any(domain.endswith("." + k) for k in _KNOWN_SERVICES) or any(esp in domain for esp in _LEGIT_ESPS)
 
 
-# ─── Pipeline HÍBRIDO principal ───────────────────────────────────
+# ─── Extração robusta de URLs ─────────────────────────────────────
+
+def extract_urls(text: str) -> list[str]:
+    """Extrai URLs de um texto usando duas estratégias."""
+    # Estratégia 1: regex curada
+    urls = URL_RE.findall(text)
+    if urls:
+        return list(set(urls))
+
+    # Estratégia 2: fallback mais permissivo
+    urls = URL_RE_FALLBACK.findall(text)
+    if urls:
+        return list(set(urls))
+
+    # Estratégia 3: procurar qualquer string que comece com http
+    urls = re.findall(r"https?://[^\s>\"')\]]*", text)
+    return list(set(urls))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PIPELINE PRINCIPAL
+# ═══════════════════════════════════════════════════════════════════
 
 async def hybrid_analyze_email(
     sender: str,
@@ -658,12 +532,6 @@ async def hybrid_analyze_email(
     run_external_apis: bool = True,
     timeout_total: float = 55.0,
 ) -> HybridResult:
-    """
-    Análise híbrida completa de email.
-
-    Executa todas as camadas em cascata com fallback gracioso.
-    Nunca retorna score 0 apenas por timeout — mantém score parcial.
-    """
     t_start = time.monotonic()
     sender = (sender or "").strip()
     body = body or ""
@@ -673,76 +541,80 @@ async def hybrid_analyze_email(
 
     result = HybridResult(sender=sender, domain=domain)
 
-    # ── Extrair texto limpo de HTML ────────────────────────────────
-    clean_body = extract_text_from_html(body) if body else ""
-    content = clean_body + " " + headers_str
-    urls_in_body = URL_RE.findall(body or "")
-
-    # ═════════════════════════════════════════════════════════════
-    # CAMADA 1: YARA
-    # ═════════════════════════════════════════════════════════════
+    # ── Extrair assunto de forma fiável ───────────────────────────
+    subject = ""
+    # Tentar JSON (vem do gmail_hook)
     try:
+        hdrs = json.loads(headers_str)
+        subject = hdrs.get("subject", "")
+    except Exception:
+        # Tentar linha "Subject: ..." em texto plano
+        m = re.search(r"(?i)^subject:\s*(.+)$", headers_str, re.MULTILINE)
+        if m:
+            subject = m.group(1).strip()
+        # Se ainda vazio, usar os primeiros 200 caracteres como assunto (fallback)
+        if not subject and body:
+            subject = body[:200].replace("\n", " ")
+
+    result.subject = subject
+    logger.debug("Assunto extraído: %s", subject)
+
+    # Combinar assunto + corpo para análise
+    full_body = (subject + "\n" + body) if subject else body
+    clean_body = extract_text_from_html(body) if body else ""
+
+    # ── Extrair URLs do assunto + corpo ───────────────────────────
+    urls_in_body = extract_urls(full_body)
+    if not urls_in_body and subject:
+        # Se não encontrou no conjunto, tenta extrair só do assunto
+        urls_in_body = extract_urls(subject)
+
+    logger.info("URLs encontradas: %s", urls_in_body)
+
+    # CAMADA 0: Palavras-chave
+    kw_score, kw_reasons = analyze_keywords(subject, clean_body or body)
+    result.layers["keywords"] = {"score": kw_score, "reasons": kw_reasons}
+    if kw_score > 0:
+        if is_legit:
+            kw_score //= 3
+        result.score += kw_score
+        result.reasons.extend(kw_reasons)
+
+    # CAMADA 1: YARA
+    try:
+        loop = asyncio.get_running_loop()
         yara_score, yara_matches = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(None, run_yara, content),
+            loop.run_in_executor(None, run_yara, full_body + "\n" + headers_str),
             timeout=3.0,
         )
         result.yara_matched = yara_matches
         result.layers["yara"] = {"score": yara_score, "matches": yara_matches}
         if yara_score > 0:
             if is_legit:
-                yara_score = yara_score // 3  # penalidade reduzida para ESPs legítimos
+                yara_score //= 3
             result.score += yara_score
             if yara_matches:
-                result.reasons.append(
-                    f"YARA: {len(yara_matches)} regra(s) activada(s): {', '.join(yara_matches)}"
-                )
+                result.reasons.append(f"YARA: {len(yara_matches)} regra(s) activada(s): {', '.join(yara_matches)}")
     except Exception as e:
-        logger.debug("YARA layer falhou: %s", e)
         result.layers["yara"] = {"error": str(e)}
 
-    # ═════════════════════════════════════════════════════════════
     # CAMADA 2: NER
-    # ═════════════════════════════════════════════════════════════
     try:
         ner_score, ner_brands, ner_reasons = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(None, run_ner, content, domain),
+            asyncio.get_running_loop().run_in_executor(None, run_ner, full_body, domain),
             timeout=5.0,
         )
         result.ner_brands = ner_brands
         result.layers["ner"] = {"score": ner_score, "brands": ner_brands}
         if ner_brands:
-            result.brand_detected = ner_brands[0] if ner_brands else None
+            result.brand_detected = ner_brands[0]
         if ner_score > 0 and not is_legit:
             result.score += ner_score
             result.reasons.extend(ner_reasons)
     except Exception as e:
-        logger.debug("NER layer falhou: %s", e)
         result.layers["ner"] = {"error": str(e)}
 
-    # ═════════════════════════════════════════════════════════════
-    # CAMADA 3: Análise local (heurísticas PT + URLs + spoofing)
-    # ═════════════════════════════════════════════════════════════
-    try:
-        from backend.services.orchestrator import quick_local_analysis
-        local = quick_local_analysis(sender, headers_str, body or "")
-        local_score = local.get("score", 0)
-        local_reasons = local.get("reasons", [])
-        result.layers["heuristics"] = {"score": local_score}
-
-        if local_score > 0:
-            if is_legit and local_score < 50:
-                local_score = local_score // 3
-            result.score += local_score
-            result.reasons.extend(local_reasons)
-
-        result.is_typosquat = local.get("is_typosquat", False)
-        result.is_spoofed = local.get("is_spoofed", False)
-
-    except Exception as e:
-        logger.warning("Heuristics layer falhou: %s", e)
-        result.layers["heuristics"] = {"error": str(e)}
-
-    # URLs locais
+    # CAMADA 3: Heurísticas locais
     max_url_score = 0
     for url in urls_in_body[:5]:
         u_score, u_reasons = analyze_url_local(url)
@@ -753,142 +625,89 @@ async def hybrid_analyze_email(
     if max_url_score > 0 and not is_legit:
         result.score += max_url_score // 2
 
-    # Typosquatting no domínio do remetente
     if not is_legit:
         is_typo, typo_brand, typo_domain = check_typosquatting(domain)
         if is_typo:
             result.is_typosquat = True
             result.score += 40
-            result.reasons.append(
-                f"Typosquatting: domínio '{domain}' imita '{typo_brand}' ({typo_domain})"
-            )
+            result.reasons.append(f"Typosquatting: '{domain}' imita '{typo_brand}' ({typo_domain})")
+        is_homoglyph, homoglyph_brand = check_homoglyph_domain(domain)
+        if is_homoglyph:
+            result.is_typosquat = True
+            result.score += 50
+            result.reasons.append(f"Homoglyph spoofing: '{domain}' imita '{homoglyph_brand}'")
 
-    # Display-name spoofing
     is_spoofed, spoofed_brand = check_display_name_spoofing(sender)
     if is_spoofed:
         result.is_spoofed = True
         result.score += 35
-        result.reasons.append(
-            f"Display-name spoofing: aparenta ser '{spoofed_brand}' mas enviado de '{domain}'"
-        )
+        result.reasons.append(f"Display-name spoofing: '{spoofed_brand}' de '{domain}'")
 
-    # ═════════════════════════════════════════════════════════════
     # CAMADA 4: ML (Groq)
-    # ═════════════════════════════════════════════════════════════
-    ml: dict = {}
-    elapsed = time.monotonic() - t_start
-    ml_timeout = max(5.0, min(12.0, timeout_total - elapsed - 15.0))
-
     try:
         from backend.services.ml_classifier import classify_with_groq
-        ml = dict(await asyncio.wait_for(
-            classify_with_groq(clean_body or headers_str, "email"),
-            timeout=ml_timeout,
-        ))
+        ml = dict(await asyncio.wait_for(classify_with_groq(clean_body or headers_str, "email"), timeout=12.0))
         result.ml = ml
         ml_score = int(ml.get("ml_score", 0))
-        ml_confidence = float(ml.get("confidence", 0))
-        ml_reasoning = str(ml.get("reasoning", ""))
-        result.layers["ml"] = {"score": ml_score, "confidence": ml_confidence}
-
-        if ml_reasoning:
-            result.reasons.insert(0, f"IA: {ml_reasoning}")
-
-        # ML override: remetente legítimo + ML seguro → cap score
-        if is_legit and ml_score < 30 and ml_confidence >= 0.5 and result.score < 50:
+        result.layers["ml"] = {"score": ml_score}
+        if ml.get("reasoning"):
+            result.reasons.insert(0, f"IA: {ml['reasoning']}")
+        if is_legit and ml_score < 30 and result.score < 50:
             result.score = min(result.score, 20)
-            result.layers["ml"]["override"] = "legit_sender_ml_safe"
         elif ml_score >= 70:
             result.score = max(result.score, ml_score - 5)
         elif ml_score >= 50:
             result.score = max(result.score, ml_score)
-
     except asyncio.TimeoutError:
-        logger.info("ML timeout para domínio %s — continuando sem ML", domain)
-        result.layers["ml"] = {"error": "timeout", "fallback": "heuristics_only"}
-        # Timeout do ML NÃO reduz score — mantém score das camadas anteriores
+        result.layers["ml"] = {"error": "timeout"}
+    except ImportError:
+        pass
     except Exception as e:
-        logger.warning("ML falhou: %s", e)
         result.layers["ml"] = {"error": str(e)}
 
-    # ═════════════════════════════════════════════════════════════
-    # CAMADA 5: DNS + SPF/DKIM/DMARC
-    # ═════════════════════════════════════════════════════════════
+    # CAMADA 5: DNS (apenas para domínios não legítimos)
     if not is_legit and domain:
-        elapsed = time.monotonic() - t_start
-        dns_timeout = max(3.0, min(5.0, timeout_total - elapsed - 12.0))
         try:
             from backend.services.dns_check import check_spf_dkim
-            dns_r = dict(await asyncio.wait_for(check_spf_dkim(domain), timeout=dns_timeout))
+            dns_r = dict(await asyncio.wait_for(check_spf_dkim(domain), timeout=5.0))
             result.dns = dns_r
             result.spf_pass = dns_r.get("spf") == "pass"
             result.dkim_pass = dns_r.get("dkim") == "pass"
             result.dmarc_pass = dns_r.get("dmarc") == "pass"
             result.layers["dns"] = dns_r
-
             if not result.spf_pass:
-                result.score += 15
-                result.reasons.append(f"SPF falhou para o domínio '{domain}'")
+                result.score += 10
+                result.reasons.append(f"SPF falhou para '{domain}'")
             if not result.dkim_pass:
-                result.score += 12
+                result.score += 5
                 result.reasons.append(f"DKIM não verificado para '{domain}'")
             if not result.dmarc_pass:
-                result.score += 8
+                result.score += 5
                 result.reasons.append(f"DMARC ausente/falhou para '{domain}'")
+        except Exception:
+            pass
 
-        except asyncio.TimeoutError:
-            logger.info("DNS timeout para %s", domain)
-            result.layers["dns"] = {"error": "timeout"}
-        except Exception as e:
-            logger.debug("DNS check falhou: %s", e)
-            result.layers["dns"] = {"error": str(e)}
-
-    # ═════════════════════════════════════════════════════════════
-    # CAMADA 6: APIs Externas (VT + GSB + URLScan + AbuseIPDB + DNSBL)
-    # ═════════════════════════════════════════════════════════════
-    elapsed = time.monotonic() - t_start
-    remaining = timeout_total - elapsed
-    # CORRIGIDO v12: removido threshold "score > 15" que bloqueava APIs
-    # quando URL não tinha sinais locais (ex: URLs em PhishTank/OpenPhish
-    # que são novas e ainda não têm padrões conhecidos).
-    # APIs externas correm SEMPRE que há URLs ou domínio para verificar,
-    # independentemente do score local.
-    should_run_apis = (
-        run_external_apis
-        and not is_legit
-        and remaining > 8.0
-        and (urls_in_body or domain)
-    )
-
-    if should_run_apis:
-        api_results = await _run_external_apis(
-            urls=urls_in_body[:3],
-            domain=domain,
-            timeout=min(remaining - 3.0, 12.0),
-        )
+    # CAMADA 6: APIs EXTERNAS — AGORA COM URLs GARANTIDOS
+    if run_external_apis and (urls_in_body or domain):
+        logger.info("🔌 Iniciando APIs externas para %d URLs", len(urls_in_body))
+        api_results = await _run_external_apis(urls=urls_in_body[:3], domain=domain)
         result.layers["external_apis"] = api_results
         result.urls_checked = api_results.get("url_details", [])
-
         ext_score = api_results.get("score", 0)
         ext_reasons = api_results.get("reasons", [])
-        apis_positive = api_results.get("apis_positive", 0)
-
+        apis_pos = api_results.get("apis_positive", 0)
         if ext_score > 0:
             result.score = max(result.score, result.score + ext_score // 2)
             result.reasons.extend(ext_reasons)
-
-        # Consenso forte: ≥2 APIs confirmam ameaça → score mínimo 80
-        if apis_positive >= 2:
+        if apis_pos >= 2:
             result.score = max(result.score, 80)
+        logger.info("🔌 APIs externas concluídas: score=%d, apis_positive=%d", ext_score, apis_pos)
 
-    # ─── Score final ──────────────────────────────────────────────
-    # Anti-FP para ESPs/serviços legítimos
+    # Anti-FP
     if is_legit and result.score < 50 and not result.is_typosquat and not result.is_spoofed:
         result.score = min(result.score, 25)
 
     result.score = max(0, min(100, result.score))
-
-    # Deduplicate reasons
     result.reasons = list(dict.fromkeys(result.reasons))
 
     if result.score >= 60:
@@ -898,239 +717,146 @@ async def hybrid_analyze_email(
     else:
         result.verdict = "SEGURO"
 
-    elapsed_total = time.monotonic() - t_start
-    logger.info(
-        "Análise híbrida concluída: score=%d, verdict=%s, layers=%s, tempo=%.1fs",
-        result.score, result.verdict,
-        list(result.layers.keys()),
-        elapsed_total,
-    )
-
+    logger.info("✅ Análise híbrida concluída: score=%d, verdict=%s, tempo=%.1fs", result.score, result.verdict, time.monotonic() - t_start)
     return result
 
 
-# ─── APIs Externas em paralelo ────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# APIs EXTERNAS – sem timeout global, com logs detalhados
+# ═══════════════════════════════════════════════════════════════════
 
-async def _run_external_apis(
-    urls: list[str],
-    domain: str,
-    timeout: float = 10.0,
-) -> dict:
-    """
-    Executa todas as APIs externas em paralelo com timeout global.
-
-    APIs:
-      - VirusTotal (por URL)
-      - Google Safe Browsing (por URL)
-      - URLScan.io (verificar existente, sem novo scan)
-      - AbuseIPDB (por IP do domínio)
-      - DNSBL (por domínio)
-
-    Retorna score de consenso + detalhes por API.
-    """
+async def _run_external_apis(urls: list[str], domain: str) -> dict:
     from backend.services.external_apis import (
-        check_virustotal,
-        check_safe_browsing,
-        check_urlscan_existing,
-        check_abuseipdb,
-        phishing_blacklist_check,   # PhishTank + OpenPhish + URLhaus — ADICIONADO v12
+        check_virustotal, check_safe_browsing, check_urlscan_existing,
+        phishing_blacklist_check, check_abuseipdb, check_dnsbl_sync,
     )
 
     score = 0
-    reasons: list[str] = []
-    url_details: list[dict] = []
+    reasons = []
+    url_details = []
     apis_positive = 0
 
-    # ── Resolver IP do domínio para AbuseIPDB ─────────────────────
-    target_ip: str | None = None
+    # Resolver IP do domínio
+    target_ip = None
     if domain:
         try:
             target_ip = await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(None, socket.gethostbyname, domain),
-                timeout=3.0,
+                asyncio.get_running_loop().run_in_executor(None, socket.gethostbyname, domain), timeout=2.0
             )
         except Exception:
             pass
 
-    # ── Preparar tasks ────────────────────────────────────────────
-    tasks = {}
-
+    tasks: dict[str, asyncio.Task] = {}
     if urls:
-        primary_url = urls[0]
-        tasks["vt"]        = check_virustotal(primary_url)
-        tasks["gsb"]       = check_safe_browsing(primary_url)
-        tasks["urlscan"]   = check_urlscan_existing(primary_url)
-        # ADICIONADO v12: blacklists em paralelo (PhishTank + OpenPhish + URLhaus)
-        # Detecta URLs confirmadas por múltiplas fontes da comunidade.
-        tasks["blacklist"] = phishing_blacklist_check(primary_url)
+        u = urls[0]
+        tasks["vt"] = asyncio.create_task(asyncio.wait_for(check_virustotal(u), timeout=15))
+        tasks["gsb"] = asyncio.create_task(asyncio.wait_for(check_safe_browsing(u), timeout=15))
+        tasks["urlscan"] = asyncio.create_task(asyncio.wait_for(check_urlscan_existing(u), timeout=15))
+        tasks["blacklist"] = asyncio.create_task(asyncio.wait_for(phishing_blacklist_check(u), timeout=20))
 
     if target_ip:
-        tasks["abuseipdb"] = check_abuseipdb(target_ip)
-
+        tasks["abuseipdb"] = asyncio.create_task(asyncio.wait_for(check_abuseipdb(target_ip), timeout=12))
     if domain:
-        tasks["dnsbl"] = _check_dnsbl_async(domain)
+        tasks["dnsbl"] = asyncio.create_task(
+            asyncio.wait_for(asyncio.get_running_loop().run_in_executor(None, check_dnsbl_sync, domain), timeout=5)
+        )
 
     if not tasks:
         return {"score": 0, "reasons": [], "apis_positive": 0, "url_details": []}
 
-    # ── Executar em paralelo ──────────────────────────────────────
-    task_names = list(tasks.keys())
-    task_coros = list(tasks.values())
+    # Aguardar cada task terminar (sem timeout global)
+    for name, task in tasks.items():
+        try:
+            await task
+        except Exception:
+            logger.debug("API %s falhou", name)
 
-    try:
-        raw_results = await asyncio.wait_for(
-            asyncio.gather(*task_coros, return_exceptions=True),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        logger.warning("APIs externas: timeout global de %.1fs", timeout)
-        return {"score": score, "reasons": reasons, "apis_positive": apis_positive, "url_details": []}
+    # Recolher resultados
+    api_results = {}
+    for name, task in tasks.items():
+        if task.done() and not task.cancelled():
+            try:
+                api_results[name] = task.result()
+            except Exception as e:
+                logger.debug("API %s erro: %s", name, e)
+                api_results[name] = {}
+        else:
+            api_results[name] = {}
 
-    api_results = dict(zip(task_names, raw_results))
+    logger.info("APIs concluídas: %s", list(api_results.keys()))
 
-    # ── Processar VirusTotal ─────────────────────────────────────
+    # Processar cada API
     vt = api_results.get("vt", {})
-    if isinstance(vt, dict) and not isinstance(vt, Exception):
-        vt_mal = int(vt.get("malicious", 0))
-        vt_sus = int(vt.get("suspicious", 0))
-        if vt_mal >= 10:
+    if isinstance(vt, dict):
+        mal = int(vt.get("malicious", 0))
+        if mal >= 10:
             score = max(score, 90)
-            reasons.append(f"VirusTotal: {vt_mal} motores detectaram ameaça CRÍTICA")
+            reasons.append(f"VirusTotal: {mal} motores CRÍTICO")
             apis_positive += 1
-        elif vt_mal >= 5:
+        elif mal >= 5:
             score = max(score, 80)
-            reasons.append(f"VirusTotal: {vt_mal} motores maliciosos (ALTO)")
+            reasons.append(f"VirusTotal: {mal} motores ALTO")
             apis_positive += 1
-        elif vt_mal >= 3:
+        elif mal >= 3:
             score = max(score, 65)
-            reasons.append(f"VirusTotal: {vt_mal} motores maliciosos")
+            reasons.append(f"VirusTotal: {mal} motores maliciosos")
             apis_positive += 1
-        elif vt_mal >= 2:
+        elif mal >= 2:
             score = max(score, 50)
-            reasons.append(f"VirusTotal: {vt_mal} motores maliciosos")
-        elif vt_mal == 1:
+            reasons.append(f"VirusTotal: {mal} motores maliciosos")
+        elif mal == 1:
             score = max(score, 25)
-            reasons.append("VirusTotal: 1 motor malicioso (inconclusivo)")
-        elif vt_sus >= 3:
-            score = max(score, 35)
-            reasons.append(f"VirusTotal: {vt_sus} motores suspeitos")
+            reasons.append("VirusTotal: 1 motor (inconclusivo)")
 
-    # ── Processar Google Safe Browsing ────────────────────────────
     gsb = api_results.get("gsb", {})
-    if isinstance(gsb, dict) and not isinstance(gsb, Exception):
-        if gsb.get("threat"):
-            gsb_types = gsb.get("types", [])
-            score = max(score, 85)
-            type_str = ", ".join(t for t in gsb_types if t) or "tipo desconhecido"
-            reasons.append(f"Google Safe Browsing: AMEAÇA detectada ({type_str})")
-            apis_positive += 1
+    if isinstance(gsb, dict) and gsb.get("threat"):
+        score = max(score, 85)
+        reasons.append(f"Google Safe Browsing: AMEAÇA detectada ({', '.join(gsb.get('types', []))})")
+        apis_positive += 1
 
-    # ── Processar URLScan ─────────────────────────────────────────
     urlscan = api_results.get("urlscan", {})
-    if isinstance(urlscan, dict) and not isinstance(urlscan, Exception):
+    if isinstance(urlscan, dict):
         if urlscan.get("malicious"):
             score = max(score, 60)
-            reasons.append("URLScan.io: URL marcada como maliciosa")
+            reasons.append("URLScan.io: URL maliciosa")
             apis_positive += 1
         elif urlscan.get("score", 0) >= 70:
             score = max(score, 50)
-            reasons.append(f"URLScan.io: score de risco {urlscan['score']}")
+            reasons.append(f"URLScan.io: risco {urlscan['score']}")
 
-    # ── Processar AbuseIPDB ───────────────────────────────────────
     abuse = api_results.get("abuseipdb", {})
-    if isinstance(abuse, dict) and not isinstance(abuse, Exception):
-        abuse_score = int(abuse.get("abuse_score", 0))
-        if abuse_score >= 80:
+    if isinstance(abuse, dict):
+        ab_score = int(abuse.get("abuse_score", 0))
+        if ab_score >= 80:
             score = max(score, 70)
-            reasons.append(
-                f"AbuseIPDB: IP {target_ip} com score de abuso {abuse_score}/100"
-            )
+            reasons.append(f"AbuseIPDB: IP {target_ip} score {ab_score}")
             apis_positive += 1
-        elif abuse_score >= 50:
+        elif ab_score >= 50:
             score = max(score, 45)
-            reasons.append(f"AbuseIPDB: IP suspeito (score={abuse_score})")
+            reasons.append(f"AbuseIPDB: IP suspeito ({ab_score})")
 
-    # ── Processar DNSBL ───────────────────────────────────────────
     dnsbl = api_results.get("dnsbl", {})
-    if isinstance(dnsbl, dict) and not isinstance(dnsbl, Exception):
-        dnsbl_hits = dnsbl.get("hits", [])
-        if dnsbl_hits:
-            score = max(score, 55)
-            reasons.append(f"DNSBL: domínio listado em {', '.join(dnsbl_hits[:2])}")
-            apis_positive += 1
+    if isinstance(dnsbl, dict) and dnsbl.get("hits"):
+        score = max(score, 55)
+        reasons.append(f"DNSBL: {', '.join(dnsbl['hits'][:2])}")
+        apis_positive += 1
 
-    # ── Processar Blacklists (PhishTank + OpenPhish + URLhaus) ────
-    # ADICIONADO v12: fonte comunitária de phishing confirmado.
-    # Uma confirmação de blacklist → score mínimo 90 (phishing activo).
     bl = api_results.get("blacklist", {})
-    if isinstance(bl, dict) and not isinstance(bl, Exception):
+    if isinstance(bl, dict):
         if bl.get("blacklisted"):
-            bl_reasons = bl.get("reasons", [])
-            bl_score   = bl.get("score", 90)
-            score      = max(score, bl_score)
-            reasons.extend(bl_reasons)
-            apis_positive += 2   # blacklist confirmada = 2 sinais (PhishTank/OpenPhish são verificados por humanos)
-            logger.info("BLACKLIST HIT: score=%d, motivos=%s", bl_score, bl_reasons[:2])
+            reasons.extend(bl.get("reasons", []))
+            score = max(score, bl.get("score", 90))
+            apis_positive += 2
+            logger.warning("BLACKLIST HIT: %s", bl.get("reasons", []))
         elif bl.get("score", 0) > 0:
-            # Na base de dados mas não confirmado
             score = max(score, bl.get("score", 0))
             reasons.extend(bl.get("reasons", []))
 
-    # ── Consenso ≥2 APIs → confirmar ─────────────────────────────
     if apis_positive >= 2:
         score = max(score, 80)
-        reasons.append(f"CONSENSO: {apis_positive} APIs independentes confirmam ameaça")
+        reasons.append(f"CONSENSO: {apis_positive} APIs confirmam ameaça")
 
-    # ── URL details para o frontend ──────────────────────────────
     if urls:
-        url_details.append({
-            "url":       urls[0],
-            "vt":        vt if isinstance(vt, dict) else {},
-            "gsb":       gsb if isinstance(gsb, dict) else {},
-            "urlscan":   urlscan if isinstance(urlscan, dict) else {},
-            "blacklist": bl if isinstance(bl, dict) else {},
-            "score":     score,
-        })
+        url_details.append({"url": urls[0], "vt": vt, "gsb": gsb, "urlscan": urlscan, "blacklist": bl, "score": score})
 
-    return {
-        "score":         min(100, score),
-        "reasons":       reasons,
-        "apis_positive": apis_positive,
-        "url_details":   url_details,
-        "abuseipdb":     abuse if isinstance(abuse, dict) else {},
-        "dnsbl":         dnsbl if isinstance(dnsbl, dict) else {},
-    }
-
-
-# ─── DNSBL assíncrono ────────────────────────────────────────────
-
-_DNSBL_ZONES = [
-    "multi.surbl.org",
-    "dbl.spamhaus.org",
-    "uribl.com",
-]
-
-
-def _dnsbl_sync(domain: str) -> dict:
-    hits: list[str] = []
-    for zone in _DNSBL_ZONES:
-        query = f"{domain}.{zone}"
-        try:
-            socket.getaddrinfo(query, None, timeout=2)
-            hits.append(zone)
-        except (socket.gaierror, OSError):
-            pass
-    return {"flagged": bool(hits), "hits": hits}
-
-
-async def _check_dnsbl_async(domain: str) -> dict:
-    try:
-        return await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(None, _dnsbl_sync, domain),
-            timeout=4.0,
-        )
-    except asyncio.TimeoutError:
-        return {"flagged": False, "hits": [], "error": "timeout"}
-    except Exception as e:
-        return {"flagged": False, "hits": [], "error": str(e)}
-    
+    return {"score": min(100, score), "reasons": reasons, "apis_positive": apis_positive, "url_details": url_details}

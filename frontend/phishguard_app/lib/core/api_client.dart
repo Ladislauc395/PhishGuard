@@ -37,18 +37,41 @@ class ApiClient {
   static const _defaultTimeout = Duration(seconds: 90);
   static const _shortTimeout = Duration(seconds: 15);
 
-  /// Construtor principal — usa valores reais
+  // ⚠️ ALTERAR AQUI quando o IP do backend mudar
+  static const String _fallbackBaseUrl = 'http://10.249.221.68:8000';
+
+  /// Construtor principal — resolve o baseUrl de forma robusta.
+  ///
+  /// CORRECÇÃO: Anteriormente usava `const String.fromEnvironment` com `??`
+  /// que resultava em string vazia em runtime, causando TimeoutException.
+  /// Agora o método [_resolveBaseUrl] garante que uma URL válida é sempre usada.
   ApiClient({
     String? baseUrl,
     http.Client? httpClient,
     FlutterSecureStorage? storage,
-  })  : baseUrl = baseUrl ??
-            const String.fromEnvironment(
-              'API_URL',
-              defaultValue: 'http://10.249.221.68:8000',
-            ),
+  })  : baseUrl = _resolveBaseUrl(baseUrl),
         _http = httpClient ?? http.Client(),
         _storage = storage ?? const FlutterSecureStorage();
+
+  /// Resolve o baseUrl de forma robusta, ignorando fromEnvironment vazio.
+  static String _resolveBaseUrl(String? explicitUrl) {
+    // 1. Se foi passado explicitamente no construtor, usar esse
+    if (explicitUrl != null && explicitUrl.isNotEmpty) {
+      return explicitUrl;
+    }
+
+    // 2. Tentar ler da variável de ambiente em compile-time
+    //    (definida com --dart-define=API_URL=http://...)
+    try {
+      const envUrl = String.fromEnvironment('API_URL');
+      if (envUrl.isNotEmpty) return envUrl;
+    } catch (_) {
+      // fromEnvironment pode falhar em alguns contextos de runtime
+    }
+
+    // 3. Fallback para o IP hardcoded — NUNCA retorna string vazia
+    return _fallbackBaseUrl;
+  }
 
   // ─── Token ──────────────────────────────────────────────────────
 
@@ -108,8 +131,6 @@ class ApiClient {
     String path,
     Map<String, dynamic> body, {
     bool requiresAuth = true,
-    // CORRECÇÃO: parâmetro renomeado de isFormData → isForm para consistência
-    // com _headers(). Todos os chamadores devem usar isForm: true.
     bool isForm = false,
     Duration? timeout,
   }) async {
